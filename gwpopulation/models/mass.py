@@ -531,15 +531,33 @@ class BaseSmoothedMassDistribution:
     """
     Generic smoothed mass distribution base class.
 
-    Implements the low-mass smoothing and power-law mass ratio
-    distribution. Requires p_m1 to be implemented.
+    Implements the low-mass smoothing and power-law mass ratio distribution.
 
     Parameters
-    ==========
-    mmin: float
-        The minimum mass considered for numerical normalization
-    mmax: float
-        The maximum mass considered for numerical normalization
+    ----------
+    mmin : float
+        Minimum mass for numerical normalisation grid.
+    mmax : float
+        Maximum mass for numerical normalisation grid.
+    normalization_shape : tuple
+        Shape of the (m1, q) grid used for norm_p_q, default (1000, 500).
+    normalize_q : bool
+        Whether to normalize p_q over the mass ratio.
+
+        ``False`` (recommended for MCMC inference):
+            Skips norm_p_q entirely. The un-normalized p_q is proportional
+            to the true value; the missing factor is a smooth function of
+            hyperparameters that is consistent across all likelihood
+            evaluations and does not bias inference.
+            No interpolant is needed — the class is trivially JAX-safe,
+            jit-compilable, and differentiable with no setup phase.
+
+        ``True`` (for post-processing / merger rate reconstruction):
+            Computes norm_p_q on the (m1, q) grid and interpolates back
+            to dataset masses via ``xp.interp``. Always correct for any
+            mass values including cosmology-derived Tracer masses.
+            No caching interpolant is used — speed is not a concern
+            at post-processing scale (O(10^3) samples).
     """
 
     primary_model = None
@@ -559,7 +577,13 @@ class BaseSmoothedMassDistribution:
     def kwargs(self):
         return dict()
 
-    def __init__(self, mmin=2, mmax=100, normalization_shape=(1000, 500), cache=True):
+    def __init__(
+        self,
+        mmin=2,
+        mmax=100,
+        normalization_shape=(1000, 500),
+        normalize_q=False,   # False = fast MCMC path; True = post-processing
+    ):
         self.mmin = mmin
         self.mmax = mmax
         self.m1s = xp.linspace(mmin, mmax, normalization_shape[0])
@@ -567,7 +591,10 @@ class BaseSmoothedMassDistribution:
         self.dm = self.m1s[1] - self.m1s[0]
         self.dq = self.qs[1] - self.qs[0]
         self.m1s_grid, self.qs_grid = xp.meshgrid(self.m1s, self.qs)
-        self.cache = cache
+        self.normalize_q = normalize_q
+        # Note: cache / _q_interpolant entirely removed.
+        # normalize_q=False  → no interpolant needed at all.
+        # normalize_q=True   → xp.interp used directly, no caching required.
 
     def __call__(self, dataset, *args, **kwargs):
         beta = kwargs.pop("beta")
@@ -576,17 +603,16 @@ class BaseSmoothedMassDistribution:
         if "jax" not in xp.__name__:
             if mmin < self.mmin:
                 raise ValueError(
-                    "{self.__class__}: mmin ({mmin}) < self.mmin ({self.mmin})"
+                    f"{self.__class__}: mmin ({mmin}) < self.mmin ({self.mmin})"
                 )
             if mmax > self.mmax:
                 raise ValueError(
-                    "{self.__class__}: mmax ({mmax}) > self.mmax ({self.mmax})"
+                    f"{self.__class__}: mmax ({mmax}) > self.mmax ({self.mmax})"
                 )
         delta_m = kwargs.get("delta_m", 0)
         p_m1 = self.p_m1(dataset, **kwargs, **self.kwargs)
         p_q = self.p_q(dataset, beta=beta, mmin=mmin, delta_m=delta_m)
-        prob = p_m1 * p_q
-        return prob
+        return p_m1 * p_q
 
     def p_m1(self, dataset, **kwargs):
         mmin = kwargs.get("mmin", self.mmin)
@@ -599,13 +625,12 @@ class BaseSmoothedMassDistribution:
         return p_m / norm
 
     def norm_p_m1(self, delta_m, **kwargs):
-        """Calculate the normalisation factor for the primary mass"""
+        """Calculate the normalisation factor for the primary mass."""
         mmin = kwargs.get("mmin", self.mmin)
         if "jax" not in xp.__name__ and delta_m == 0:
             return 1
         p_m = self.__class__.primary_model(self.m1s, **kwargs)
         p_m *= self.smoothing(self.m1s, mmin=mmin, mmax=self.mmax, delta_m=delta_m)
-
         norm = xp.nan_to_num(trapezoid(p_m, self.m1s)) * (delta_m != 0) + 1 * (
             delta_m == 0
         )
@@ -619,59 +644,59 @@ class BaseSmoothedMassDistribution:
             mmax=dataset["mass_1"],
             delta_m=delta_m,
         )
-
-        try:
-            if self.cache:
-                p_q /= self.norm_p_q(beta=beta, mmin=mmin, delta_m=delta_m)
-            else:
-                self._cache_q_norms(dataset["mass_1"])
-                p_q /= self.norm_p_q(beta=beta, mmin=mmin, delta_m=delta_m)
-        except (AttributeError, TypeError, ValueError):
-            self._cache_q_norms(dataset["mass_1"])
-            p_q /= self.norm_p_q(beta=beta, mmin=mmin, delta_m=delta_m)
-
+        if self.normalize_q:
+            p_q /= self.norm_p_q(
+                beta=beta, mmin=mmin, delta_m=delta_m,
+                masses=dataset["mass_1"],
+            )
         return xp.nan_to_num(p_q)
 
-    def norm_p_q(self, beta, mmin, delta_m):
-        """Calculate the mass ratio normalisation by linear interpolation"""
+    def norm_p_q(self, beta, mmin, delta_m, masses):
+        """
+        Compute the mass-ratio normalisation at the given masses.
+
+        Only called when ``self.normalize_q=True`` (post-processing).
+
+        Uses ``xp.interp`` directly — no caching interpolant. This is
+        correct for all mass values including cosmology-derived Tracer
+        masses (standard inference, cosmological inference, or vmap over
+        posterior samples). At post-processing scale the O(N log N) cost
+        of interp is negligible.
+
+        Parameters
+        ----------
+        masses : array-like
+            Primary masses to evaluate the normalisation at. May be a
+            concrete array (standard) or a JAX Tracer (cosmological).
+        """
         p_q = powerlaw(self.qs_grid, beta, 1, mmin / self.m1s_grid)
         p_q *= self.smoothing(
-            self.m1s_grid * self.qs_grid, mmin=mmin, mmax=self.m1s_grid, delta_m=delta_m
+            self.m1s_grid * self.qs_grid,
+            mmin=mmin,
+            mmax=self.m1s_grid,
+            delta_m=delta_m,
         )
-
         norms = xp.nan_to_num(trapezoid(p_q, self.qs, axis=0)) * (delta_m != 0) + 1 * (
             delta_m == 0
         )
-
-        return self._q_interpolant(norms)
-
-    def _cache_q_norms(self, masses):
-        """
-        Cache the information necessary for linear interpolation of the mass
-        ratio normalisation
-        """
-        from .interped import _setup_interpolant
-
-        self._q_interpolant = _setup_interpolant(
-            self.m1s, masses, kind="linear", backend=xp
-        )
+        # xp.interp is JAX-native, differentiable w.r.t. both masses and
+        # norms, and correct for any input including Tracer masses.
+        return xp.interp(masses, self.m1s, norms)
 
     @staticmethod
     def smoothing(masses, mmin, mmax, delta_m):
         """
-        Apply a one sided window between mmin and mmin + delta_m to the
-        mass pdf.
+        Apply a one-sided window between mmin and mmin + delta_m.
 
-        The upper cut off is a step function,
-        the lower cutoff is a logistic rise over delta_m solar masses.
+        The upper cutoff is a step function; the lower cutoff is a
+        logistic rise over delta_m solar masses.
 
-        See T&T18 Eqs 7-8
-        Note that there is a sign error in that paper.
+        See T&T18 Eqs 7-8 (note sign error in that paper).
 
         S = (f(m - mmin, delta_m) + 1)^{-1}
         f(m') = delta_m / m' + delta_m / (m' - delta_m)
 
-        See also, https://en.wikipedia.org/wiki/Window_function#Planck-taper_window
+        See also https://en.wikipedia.org/wiki/Window_function#Planck-taper_window
         """
         if "jax" in xp.__name__ or delta_m > 0.0:
             shifted_mass = xp.nan_to_num((masses - mmin) / delta_m, nan=0)
