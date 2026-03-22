@@ -18,6 +18,9 @@ __all__ = [
     "MultiPeakSmoothedMassDistribution",
     "BrokenPowerLawSmoothedMassDistribution",
     "BrokenPowerLawPeakSmoothedMassDistribution",
+    "OnePeakBrokenPowerLawSmoothedMassDistribution",
+    "TwoPeakBrokenPowerLawSmoothedMassDistribution",
+    "ThreePeakBrokenPowerLawSmoothedMassDistribution"
     "InterpolatedPowerlaw",
     "double_power_law_primary_mass",
     "double_power_law_peak_primary_mass",
@@ -32,6 +35,9 @@ __all__ = [
     "two_component_primary_mass_ratio",
     "two_component_primary_secondary_independent",
     "two_component_primary_secondary_identical",
+    "four_component_double_power_law_primary_mass",
+    "three_component_double_power_law_primary_mass",
+    "two_component_double_power_law_primary_mass"
 ]
 
 
