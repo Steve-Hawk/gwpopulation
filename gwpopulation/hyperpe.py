@@ -55,7 +55,7 @@ from .experimental.sgwb_utils import wave_energy, omega_gw, _H0_si
 
 xp = np
 
-__all__ = ["HyperparameterLikelihood", "RateLikelihood", "xp"]
+__all__ = ["HyperparameterLikelihood", "RateLikelihood", "LocalMergerRateLikelihood", "Stochastic_Likelihood", "JointCBCSGWBLikelihood", "xp"]
 
 
 class HyperparameterLikelihood(Likelihood):
@@ -485,7 +485,7 @@ class RateLikelihood(HyperparameterLikelihood):
 class LocalMergerRateLikelihood(HyperparameterLikelihood):
     """
     A likelihood for inferring hyperparameter posterior distributions
-    and estimating rates with including selection effects.
+    and estimating local merger rates with including selection effects.
 
     see the prepared doc.
 
@@ -526,8 +526,7 @@ class LocalMergerRateLikelihood(HyperparameterLikelihood):
 
 
 def _compute_single_wave_energy(
-    inj_sample, waveform_generator, target_frequencies, use_approxed_waveform, inspiral_only
-):
+    inj_sample, waveform_generator, target_frequencies):
     """
     Module-level helper that computes the wave energy spectrum for a
     single injection sample.  Kept at module level so that it is
@@ -567,9 +566,7 @@ def _compute_single_wave_energy(
     waveform_frequencies = waveform_generator.frequency_array
     wave_en = wave_energy(
         waveform_generator,
-        inj_sample,
-        use_approxed_waveform=use_approxed_waveform,
-        inspiral_only=inspiral_only,
+        inj_sample
     )
     return np.interp(target_frequencies, waveform_frequencies, wave_en)
 
@@ -604,9 +601,9 @@ class Stochastic_Likelihood(Likelihood):
         """
         Parameters
         ----------
-        samples: 
-            pandas dataframe. Must contain at least ``redshift`` and
-            ``luminosity_distance``.  May contain a ``prior`` column
+        samples: dict
+            Must contain at least ``mass_1``, ``mass_ratio``,``redshift`` and
+            ``luminosity_distance`` (removed later).  May contain a ``prior`` column
             with the original proposal-prior values per sample.
         stochastic_data: dict
             Measured SGWB data.  Must contain:
@@ -623,9 +620,7 @@ class Stochastic_Likelihood(Likelihood):
             energies are computed automatically from ``samples`` using
             the waveform configuration given below.
         waveform_approximant: str, optional
-            LAL waveform approximant string, or the special values
-            ``"PC_waveform"`` / ``"PC_waveform_inspiral_only"`` for the
-            piecewise closed-form amplitude model.
+            LAL waveform approximant string,
             Default ``"IMRPhenomD"``.
         waveform_duration: float, optional
             Duration in seconds for the waveform generator.  Default 10.
@@ -656,15 +651,21 @@ class Stochastic_Likelihood(Likelihood):
         self.samples = samples
         #todo create another attribute to save redshift from samples input.
         #! check it later.
-        self.samples_redshift = samples["redshift"]
+        self.samples_redshift = self.samples["redshift"]
         # after accesing luminosity information, that column should be removed from samples.
-        self.samples_default_luminosity_distance = samples["luminosity_distance"]
+        self.samples_default_luminosity_distance = self.samples.pop("luminosity_distance")
 
         # real measurements of the stochastic search.
         self.CIJ = stochastic_data["CIJ"]
         self.sigma = stochastic_data["sigma"]
         self.frequencies = stochastic_data["frequencies"]
 
+        if "prior" in self.samples:
+            self.sampling_prior = self.samples.pop("prior")
+        else:
+            logger.info("No prior values provided, defaulting to 1.")
+            self.sampling_prior = 1
+        
         if wave_energies is not None:
             self.wave_energies = xp.asarray(wave_energies)
         else:
@@ -684,12 +685,6 @@ class Stochastic_Likelihood(Likelihood):
         
         super().__init__()
 
-        # add stochastic data reading interface here.
-        if "prior" in self.data:
-            self.sampling_prior = self.data.pop("prior")
-        else:
-            logger.info("No prior values provided, defaulting to 1.")
-            self.sampling_prior = 1
         # used for cosmological inference.
         self.cosmology_model = self._find_cosmo_model()
         self.redshift_model = self._find_redshift_model()
@@ -746,7 +741,7 @@ class Stochastic_Likelihood(Likelihood):
  
         target_frequencies = np.asarray(self.frequencies)
  
-        # Build a list of single-event dictionaries.
+        # Build a list of single-event dictionaries and fill in required key-value pairs
         inj_samples = self._build_injection_list()
  
         if multiprocess:
@@ -772,20 +767,28 @@ class Stochastic_Likelihood(Likelihood):
 
     def _build_injection_list(self):
         """
-        Convert the columnar ``self.data`` dict into a list of
+        Convert the columnar ``self.samples`` dict into a list of
         single-event dictionaries, one per proposal sample.
  
         Returns
         -------
         list[dict]
         """
-        keys = list(self.data.keys())
+        build_samples = self.samples.copy()
+        build_samples['mass_1_source'] = build_samples.pop('mass_1')
+        build_samples['mass_1_detector'] = build_samples['mass_1'] * (1. + build_samples['redshift'])
+        build_samples['mass_2_detector'] = build_samples['mass_1_detector'] * build_samples['mass_ratio']
+
+        # build_samples is a dict contains `mass_1_source`, `mass_ratio`, `mass_1_detector`, `mass_2_detector`, `redshift`
+
+        keys = list(build_samples.keys())
         n = self.n_samples
         inj_samples = []
         for i in range(n):
             inj_samples.append(
-                {key: float(self.data[key][i]) for key in keys}
+                {key: float(self.samples[key][i]) for key in keys}
             )
+        
         return inj_samples
 
 
