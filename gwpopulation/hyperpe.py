@@ -51,7 +51,7 @@ from bilby.hyper.model import Model
 
 from .utils import get_name, to_number, to_numpy
 from .models.redshift import _Redshift
-from .experimental.sgwb_utils import wave_energy, omega_gw, _H0_si
+from .experimental.sgwb_utils import wave_energy, omega_gw
 
 xp = np
 
@@ -648,6 +648,7 @@ class Stochastic_Likelihood(Likelihood):
                 "or a class with attribute 'parameters' and method 'prob'"
             )
         self.hyper_prior = hyper_prior
+        self.conversion_function = conversion_function
         self.samples = samples
         #todo create another attribute to save redshift from samples input.
         #! check it later.
@@ -690,6 +691,15 @@ class Stochastic_Likelihood(Likelihood):
         self.redshift_model = self._find_redshift_model()
         self._noise_log_likelihood = None
     
+    # -----------------------------------------------------------------
+    # Properties
+    # -----------------------------------------------------------------
+    @property
+    def n_samples(self):                                               
+        """Number of proposal samples."""
+        key = next(iter(self.samples))
+        return len(self.samples[key])
+
     # -----------------------------------------------------------------
     # Wave-energy computation
     # -----------------------------------------------------------------
@@ -776,7 +786,7 @@ class Stochastic_Likelihood(Likelihood):
         """
         build_samples = self.samples.copy()
         build_samples['mass_1_source'] = build_samples.pop('mass_1')
-        build_samples['mass_1_detector'] = build_samples['mass_1'] * (1. + build_samples['redshift'])
+        build_samples['mass_1_detector'] = build_samples['mass_1_source'] * (1. + build_samples['redshift'])
         build_samples['mass_2_detector'] = build_samples['mass_1_detector'] * build_samples['mass_ratio']
 
         # build_samples is a dict contains `mass_1_source`, `mass_ratio`, `mass_1_detector`, `mass_2_detector`, `redshift`
@@ -786,7 +796,7 @@ class Stochastic_Likelihood(Likelihood):
         inj_samples = []
         for i in range(n):
             inj_samples.append(
-                {key: float(self.samples[key][i]) for key in keys}
+                {key: float(build_samples[key][i]) for key in keys}
             )
         
         return inj_samples
@@ -811,7 +821,7 @@ class Stochastic_Likelihood(Likelihood):
     def get_luminosity_distance_from_cosmology_model(self, parameters):
         """Get cosmology model from hyper_prior."""
         if self.cosmology_model is not None:
-            return self.cosmology_model.cosmology(parameters).luminoisity_distance(self.samples_redshift)
+            return self.cosmology_model.cosmology(parameters).luminosity_distance(self.samples_redshift)
         else:
             return self.samples_default_luminosity_distance
     

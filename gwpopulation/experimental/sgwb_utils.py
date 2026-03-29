@@ -30,25 +30,25 @@ except Exception:
  
 # 1 Mpc in metres — used to convert H0 [km/s/Mpc] → H0 [1/s]
 _MPC_IN_METRES = 3.0856775814913673e22
-
-
+ 
+ 
 from astropy.constants import c
 light_speed = c.value
 m_sun = 1.99e30 #kg
 G = 6.67e-11 #N*m^2/kg^2
 mass_to_seconds_conv = G/light_speed**3
-
+ 
 def wave_energy(waveform_generator, injection_parameters):
     """
     Compute the GW energy for a given waveform and set of parameters.
-
+ 
     Parameters
     =======
     waveform_generator: bilby waveform generator object
         Waveform generator for a specific waveform and set of time/frequency parameters.
     injection_parameters: dict
         Dictionary of individual GW parameters.
-
+ 
     Returns
     =======
     The wave energy spectrum in a np.array.
@@ -60,18 +60,22 @@ def wave_energy(waveform_generator, injection_parameters):
     except KeyError:
         pass
     
-    try:
+    try:                                                        # FIX #11: catch only Exception, log useful info
         polarizations = waveform_generator.frequency_domain_strain(injection_parameters)
         # Could make this into a FrequencySeries...
         return (np.abs(polarizations['plus'])**2 + np.abs(polarizations['cross'])**2)
-    except:
-        print('ouch!')
+    except Exception as exc:
+        logger.warning(
+            "wave_energy: waveform generation failed for sample "
+            f"(m1_det={injection_parameters.get('mass_1_detector', '?')}, "
+            f"m2_det={injection_parameters.get('mass_2_detector', '?')}): {exc}"
+        )
         return np.zeros_like(waveform_generator.frequency_array)
     
-def omega_gw(frequencies, wave_energies, weights,  Rate_norm, H0=None):
+def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
     """
     Compute Omega GW spectrum given a set of wave energy spectra and associated weights.
-
+ 
     Parameters
     =======
     frequencies: np.array
@@ -79,18 +83,18 @@ def omega_gw(frequencies, wave_energies, weights,  Rate_norm, H0=None):
     wave_energies: np.array
         Array of wave energy spectra.
     weights: np.array
-        Array of weights per sample: sampling weights * rescale of luminoisity distance.
-    Rate norm: float, optional 
-        it should be R0 * \int dz (dV/dz) * (1+z)^{-1} * p(z) where R0 is the local merger rate and p(z) is the redshift distribution of mergers.
+        Array of weights per sample: sampling weights * rescale of luminosity distance.
+    Rate_norm: float
+        It should be R0 * \\int dz (dV/dz) * (1+z)^{-1} * p(z) where R0 is the local merger rate and p(z) is the redshift distribution of mergers.
     H0: float or None, optional
         Hubble constant in km/s/Mpc.  If *None* (default) the Planck15
         value is used.  Pass this when performing cosmological inference
         so that the :math:`f^3 / H_0^2` prefactor tracks the sampled
         cosmology.
-
+ 
     Returns
     =======
-    The wave energy spectrum in a np.array.
+    The Omega_GW spectrum in a np.array.
     """
     if H0 is not None:
         # Convert H0 from km/s/Mpc to 1/s
@@ -98,11 +102,11 @@ def omega_gw(frequencies, wave_energies, weights,  Rate_norm, H0=None):
     else:
         H0_si = _DEFAULT_H0_SI
     
-    conv = frequencies**3 * 4. * np.pi**2 / (3 * _H0_si**2)
+    conv = frequencies**3 * 4. * np.pi**2 / (3 * H0_si**2)  # FIX #1: was `_H0_si` → now `H0_si`
     # might consider adding some checks for re-weighting, like:
     # highvals = np.sort(weights)[-10:]
     # weights[weights==highvals]=0
     N_samples = len(weights)
-    weighted_energy = xp.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
-
+    weighted_energy = np.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
+ 
     return Rate_norm * conv * weighted_energy
