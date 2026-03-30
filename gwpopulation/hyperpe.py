@@ -816,6 +816,8 @@ class Stochastic_Likelihood(Likelihood):
         for model in self.hyper_prior.models:
             if isinstance(model, _Redshift):
                 return model
+            else:
+                logger.info("No Redshift model found in hyper_prior, probably needs further check.")
         return None
     
     def get_luminosity_distance_from_cosmology_model(self, parameters):
@@ -892,7 +894,7 @@ class Stochastic_Likelihood(Likelihood):
         weights: array-like, shape ``(N_samples,)``
         """
         parameters, _ = self.conversion_function(parameters)
-        pop_prob = self.hyper_prior.prob(self.data, **parameters)
+        pop_prob = self.hyper_prior.prob(self.samples, **parameters)
         weights = pop_prob / self.sampling_prior
  
         # Rescale for variable cosmology (dL_fid / dL_new)^2.
