@@ -19,7 +19,8 @@
 # This file is part of the popstock package.
 
 import bilby
-import numpy as xp
+from bilby.core.utils import logger
+import numpy as np
 
 try:
     from wcosmo.astropy import Planck15 as _default_cosmo
@@ -102,7 +103,7 @@ def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
     else:
         H0_si = _DEFAULT_H0_SI
     
-    conv = frequencies**3 * 4. * np.pi**2 / (3 * H0_si**2)  # FIX #1: was `_H0_si` → now `H0_si`
+    conv = frequencies**3 * 4. * np.pi**2 / (3 * H0_si**2)
     # might consider adding some checks for re-weighting, like:
     # highvals = np.sort(weights)[-10:]
     # weights[weights==highvals]=0
