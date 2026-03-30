@@ -649,7 +649,7 @@ class Stochastic_Likelihood(Likelihood):
             )
         self.hyper_prior = hyper_prior
         self.conversion_function = conversion_function
-        self.samples = samples
+        self.samples = samples.copy()
         #todo create another attribute to save redshift from samples input.
         #! check it later.
         self.samples_redshift = self.samples["redshift"]
