@@ -6,7 +6,7 @@ _MPC_IN_METRES = 3.0856775814913673e22
 km_Mpc = 1e3 / _MPC_IN_METRES
 c = 2.998e8
 G = 6.67e-11
-_RhoC = 8.*np.pi*G/(3*c**2)/(km_Mpc**3)
+_RhoC = 8.*np.pi*G/(3*c**2)/(km_Mpc**3)/(_MPC_IN_METRES**3)
 
 
 # adopt from icarogw package
