@@ -629,10 +629,7 @@ class StochasticLikelihood(Likelihood):
                 self._default_w0 = float(cosmo.w0) if not callable(cosmo.w0) else -1.0
             else:
                 self._default_w0 = -1.0
-            if hasattr(cosmo, 'H0'):
-                self._default_H0 = float(cosmo.H0) if not callable(cosmo.H0) else 67.74
-            else:
-                self._default_H0 = 67.74
+            self._default_H0 = 67.74
         else:
             self._default_Om0 = 0.3065
             self._default_w0 = -1.0
