@@ -1,113 +1,127 @@
-# -*- coding: utf-8 -*-
-# Copyright (C) Arianna I. Renzini 2024 (original author of popstock)
-# Xiao-Xiao Kou made changes to make it work with GWPopulation for a joint inference of the population and the SGWB.
-#
-# This program is free software; you can redistribute it and/or modify it
-# under the terms of the GNU General Public License as published by the
-# Free Software Foundation; either version 3 of the License, or (at your
-# option) any later version.
-#
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General
-# Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-#
-# This file is part of the popstock package.
-
-import bilby
-from bilby.core.utils import logger
 import numpy as np
+import astropy.constants
 
-try:
-    from wcosmo.astropy import Planck15 as _default_cosmo
-    _DEFAULT_H0_SI = _default_cosmo.H0.to("1/s").value  # H0 in 1/s
-except Exception:
-    # fallback: H0 = 67.74 km/s/Mpc in SI (1/s)
-    _DEFAULT_H0_SI = 67.74 * 1e3 / (3.0856775814913673e22)  # km/s/Mpc -> 1/s
- 
-# 1 Mpc in metres — used to convert H0 [km/s/Mpc] → H0 [1/s]
+
 _MPC_IN_METRES = 3.0856775814913673e22
- 
- 
-from astropy.constants import c
-light_speed = c.value
-m_sun = 1.99e30 #kg
-G = 6.67e-11 #N*m^2/kg^2
-mass_to_seconds_conv = G/light_speed**3
- 
-def wave_energy(waveform_generator, injection_parameters):
-    """
-    Compute the GW energy for a given waveform and set of parameters.
- 
+km_Mpc = 1e3 / _MPC_IN_METRES
+c = 2.998e8
+G = 6.67e-11
+_RhoC = 8.*np.pi*G/(3*c**2)/(km_Mpc**3)
+
+
+# adopt from icarogw package
+def v(Mtot,f):
+    '''
+    This function computes the v factor (specify what it is)
+    
     Parameters
-    =======
-    waveform_generator: bilby waveform generator object
-        Waveform generator for a specific waveform and set of time/frequency parameters.
-    injection_parameters: dict
-        Dictionary of individual GW parameters.
- 
-    Returns
-    =======
-    The wave energy spectrum in a np.array.
+    ----------
+    Mtot: float
+        Total mass of the binay in solar masses
+    f: array
+        Frequency array
+    '''
+    MsunToSec = astropy.constants.M_sun.value*astropy.constants.G.value/np.power(astropy.constants.c.value,3.)
+    return np.array([(np.pi*MsunToSec*f*Mtot)**(1./3.), (np.pi*MsunToSec*f*Mtot)**(2./3.), (np.pi*MsunToSec*f*Mtot)])
+
+def dEdf(Mtot,freqs,eta=0.25,inspiralOnly=False,PN=True,chi=None):
+
     """
+    Function to compute the energy spectrum radiated by a CBC. Taken from (https://ui.adsabs.harvard.edu/abs/2023arXiv231017625T/abstract)
     
-    try:
-        #set optimal waveform duration
-        waveform_generator.waveform_duration = bilby.gw.utils.calculate_time_to_merger(waveform_generator.waveform_arguments['minimum_frequency'], injection_parameters['mass_1_detector'], injection_parameters['mass_2_detector'])
-    except KeyError:
-        pass
-    
-    try:                                                        # FIX #11: catch only Exception, log useful info
-        polarizations = waveform_generator.frequency_domain_strain(injection_parameters)
-        # Could make this into a FrequencySeries...
-        return (np.abs(polarizations['plus'])**2 + np.abs(polarizations['cross'])**2)
-    except Exception as exc:
-        logger.warning(
-            "wave_energy: waveform generation failed for sample "
-            f"(m1_det={injection_parameters.get('mass_1_detector', '?')}, "
-            f"m2_det={injection_parameters.get('mass_2_detector', '?')}): {exc}"
-        )
-        return np.zeros_like(waveform_generator.frequency_array)
-    
-def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
+    INPUTS
+    Mtot: Total mass in units of Msun
+    freqs: Array of frequencies at which we want to evaluate dEdf
+    eta: Reduced mass ratio. Defaults to 0.25 (equal mass)
+    inspiralOnly: If True, will return only energy radiated through inspiral
     """
-    Compute Omega GW spectrum given a set of wave energy spectra and associated weights.
- 
-    Parameters
-    =======
-    frequencies: np.array
-        Frequency array associated to the wave energy.
-    wave_energies: np.array
-        Array of wave energy spectra.
-    weights: np.array
-        Array of weights per sample: sampling weights * rescale of luminosity distance.
-    Rate_norm: float
-        It should be R0 * \\int dz (dV/dz) * (1+z)^{-1} * p(z) where R0 is the local merger rate and p(z) is the redshift distribution of mergers.
-    H0: float or None, optional
-        Hubble constant in km/s/Mpc.  If *None* (default) the Planck15
-        value is used.  Pass this when performing cosmological inference
-        so that the :math:`f^3 / H_0^2` prefactor tracks the sampled
-        cosmology.
- 
-    Returns
-    =======
-    The Omega_GW spectrum in a np.array.
-    """
-    if H0 is not None:
-        # Convert H0 from km/s/Mpc to 1/s
-        H0_si = H0 * 1e3 / _MPC_IN_METRES
+
+    Msun = astropy.constants.M_sun.value
+    c= astropy.constants.c.value
+    G= astropy.constants.G.value
+    MsunToSec = astropy.constants.M_sun.value*astropy.constants.G.value/np.power(astropy.constants.c.value,3.)
+
+
+    if chi is None:
+        chi = 0.
+
+    # Initialize energy density
+    dEdf_spectrum = np.zeros_like(freqs)
+
+    if inspiralOnly:
+
+        # If inspiral only (used for BNS), cut off at the ISCO
+        fMerge = 2.*c**3./(6.*np.sqrt(6.)*2.*np.pi*G*Mtot*Msun)
+        inspiral = freqs<fMerge
+        dEdf_spectrum[inspiral] = np.power(freqs[inspiral],-1./3.)
+
     else:
-        H0_si = _DEFAULT_H0_SI
-    
-    conv = frequencies**3 * 4. * np.pi**2 / (3 * H0_si**2)
-    # might consider adding some checks for re-weighting, like:
-    # highvals = np.sort(weights)[-10:]
-    # weights[weights==highvals]=0
-    N_samples = len(weights)
-    weighted_energy = np.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
- 
-    return Rate_norm * conv * weighted_energy
+
+        if PN:
+
+            # Waveform model from Ajith+ 2011 (10.1103/PhysRevLett.106.241101)
+
+            # PN corrections to break frequencies bounding different waveform regimes
+            # See Eq. 2 and Table 1
+            eta_arr = np.array([eta,eta*eta,eta*eta*eta])
+            chi_arr = np.array([1,chi,chi*chi]).T
+            fM_corrections = np.array([[0.6437,0.827,-0.2706],[-0.05822,-3.935,0.],[-7.092,0.,0.]])
+            fR_corrections = np.array([[0.1469,-0.1228,-0.02609],[-0.0249,0.1701,0.],[2.325,0.,0.]])
+            fC_corrections = np.array([[-0.1331,-0.08172,0.1451],[-0.2714,0.1279,0.],[4.922,0.,0.]])
+            sig_corrections = np.array([[-0.4098,-0.03523,0.1008],[1.829,-0.02017,0.],[-2.87,0.,0.]])
+
+            # Define frequencies
+            # See Eq. 2 and Table 1
+            fMerge = (1. - 4.455*(1.-chi)**0.217 + 3.521*(1.-chi)**0.26 + eta_arr.dot(fM_corrections).dot(chi_arr))/(np.pi*Mtot*MsunToSec)
+            fRing = (0.5 - 0.315*(1.-chi)**0.3 + eta_arr.dot(fR_corrections).dot(chi_arr))/(np.pi*Mtot*MsunToSec)
+            fCut = (0.3236 + 0.04894*chi + 0.01346*chi*chi + eta_arr.dot(fC_corrections).dot(chi_arr))/(np.pi*Mtot*MsunToSec)
+            sigma = (0.25*(1.-chi)**0.45 - 0.1575*(1.-chi)**0.75 + eta_arr.dot(sig_corrections).dot(chi_arr))/(np.pi*Mtot*MsunToSec)
+
+            # Identify piecewise components
+            inspiral = freqs<fMerge
+            merger = (freqs>=fMerge)*(freqs<fRing)
+            ringdown = (freqs>=fRing)*(freqs<fCut)
+
+            # Define PN amplitude corrections
+            # See Eq. 1 and following text
+            alpha = np.array([0., -323./224. + 451.*eta/168., (27./8.-11.*eta/6.)*chi])
+            eps = np.array([1.4547*chi-1.8897, -1.8153*chi+1.6557, 0.])
+            vs = v(Mtot,freqs)
+
+            # Compute multiplicative scale factors to enforce continuity of dEdf across boundaries
+            # Note that w_m and w_r are the ratios (inspiral/merger) and (merger/ringdown), as defined below
+            v_m = v(Mtot,fMerge)
+            v_r = v(Mtot,fRing)
+            w_m = np.power(fMerge,-1./3.)*np.power(1.+alpha.dot(v_m),2.)/(np.power(fMerge,2./3.)*np.power(1.+eps.dot(v_m),2.)/fMerge)
+            w_r = (w_m*np.power(fRing,2./3.)*np.power(1.+eps.dot(v_r),2.)/fMerge)/(np.square(fRing)/(fMerge*fRing**(4./3.)))
+
+            # Energy spectrum --> https://arxiv.org/abs/2306.09861
+            dEdf_spectrum[inspiral] = np.power(freqs[inspiral],-1./3.)*np.power(1.+alpha.dot(vs[:,inspiral]),2.)
+            dEdf_spectrum[merger] = w_m*np.power(freqs[merger],2./3.)*np.power(1.+eps.dot(vs[:,merger]),2.)/fMerge
+            dEdf_spectrum[ringdown] = w_r*np.square(freqs[ringdown]/(1.+np.square((freqs[ringdown]-fRing)/(sigma/2.))))/(fMerge*fRing**(4./3.))
+
+        else:
+
+            # Waveform model from Ajith+ 2008 (10.1103/PhysRevD.77.104017)
+            # Define IMR parameters
+            # See Eq. 4.19 and Table 1
+            fMerge = (0.29740*eta**2. + 0.044810*eta + 0.095560)/(np.pi*Mtot*MsunToSec)
+            fRing = (0.59411*eta**2. + 0.089794*eta + 0.19111)/(np.pi*Mtot*MsunToSec)
+            fCut = (0.84845*eta**2. + 0.12828*eta + 0.27299)/(np.pi*Mtot*MsunToSec)
+            sigma = (0.50801*eta**2. + 0.077515*eta + 0.022369)/(np.pi*Mtot*MsunToSec)
+
+            # Identify piecewise components
+            inspiral = freqs<fMerge
+            merger = (freqs>=fMerge)*(freqs<fRing)
+            ringdown = (freqs>=fRing)*(freqs<fCut)
+
+            # Energy spectrum
+            dEdf_spectrum[inspiral] = np.power(freqs[inspiral],-1./3.)
+            dEdf_spectrum[merger] = np.power(freqs[merger],2./3.)/fMerge
+            dEdf_spectrum[ringdown] = np.square(freqs[ringdown]/(1.+np.square((freqs[ringdown]-fRing)/(sigma/2.))))/(fMerge*fRing**(4./3.))
+
+
+    # Normalization
+    Mc = np.power(eta,3./5.)*Mtot*Msun
+    amp = np.power(G*np.pi,2./3.)*np.power(Mc,5./3.)/3.
+    return amp*dEdf_spectrum
