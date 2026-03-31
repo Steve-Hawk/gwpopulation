@@ -46,16 +46,17 @@ import types
 
 import numpy as np
 from bilby.core.likelihood import Likelihood
-from bilby.core.utils import logger
+from bilby.core.utils import logger, infer_args_from_function_except_n_args
 from bilby.hyper.model import Model
 
 from .utils import get_name, to_number, to_numpy
 from .models.redshift import _Redshift
-from .experimental.sgwb_utils import wave_energy, omega_gw
+from .models.mass import BaseSmoothedMassDistribution
+from .experimental.sgwb_utils import dEdf, _RhoC
 
 xp = np
 
-__all__ = ["HyperparameterLikelihood", "RateLikelihood", "LocalMergerRateLikelihood", "Stochastic_Likelihood", "JointCBCSGWBLikelihood", "xp"]
+__all__ = ["HyperparameterLikelihood", "RateLikelihood", "LocalMergerRateLikelihood", "StochasticLikelihood", "JointCBCStochasticLikelihood", "xp"]
 
 
 class HyperparameterLikelihood(Likelihood):
@@ -525,59 +526,7 @@ class LocalMergerRateLikelihood(HyperparameterLikelihood):
             return total_selection
 
 
-def _compute_single_wave_energy(
-    inj_sample, waveform_generator, target_frequencies):
-    """
-    Module-level helper that computes the wave energy spectrum for a
-    single injection sample.  Kept at module level so that it is
-    pickle-able for :mod:`multiprocessing`.
- 
-    Missing waveform parameters (``phase``, ``theta_jn``, spins) are
-    filled with isotropic/zero defaults.
- 
-    Parameters
-    ----------
-    inj_sample: dict
-        Single-event parameter dictionary.
-    waveform_generator: bilby.gw.WaveformGenerator
-        The waveform generator instance.
-    target_frequencies: np.ndarray
-        The frequency grid to interpolate onto.
-    use_approxed_waveform: bool
-        Whether to use the piecewise-closed-form amplitude approximation.
-    inspiral_only: bool
-        If ``use_approxed_waveform`` is True, whether to truncate at ISCO.
- 
-    Returns
-    -------
-    np.ndarray
-        The wave energy spectrum interpolated onto *target_frequencies*.
-    """
-    # Fill defaults for orientation / spin parameters that may be absent.
-    if "phase" not in inj_sample:
-        inj_sample["phase"] = 2 * np.pi * np.random.rand()
-    if "theta_jn" not in inj_sample:
-        inj_sample["theta_jn"] = np.arccos(np.random.rand() * 2.0 - 1.0)
-    # we don't expect the spins to have a significant effect on the SGWB, so we can just set them to zero in most cases.
-    for key in ("a_1", "a_2", "tilt_1", "tilt_2"):
-        if key not in inj_sample:
-            inj_sample[key] = 0
- 
-    waveform_frequencies = waveform_generator.frequency_array
-    wave_en = wave_energy(
-        waveform_generator,
-        inj_sample
-    )
-    return np.interp(target_frequencies, waveform_frequencies, wave_en)
-
-
-def _mp_worker(args):
-    """Thin wrapper so that :func:`multiprocessing.Pool.map` can call
-    :func:`_compute_single_wave_energy` with a single tuple argument."""
-    return _compute_single_wave_energy(*args)
-
-
-class Stochastic_Likelihood(Likelihood):
+class StochasticLikelihood(Likelihood):
     """
     A likelihood for inferring hyperparameter posterior distributions
     and estimating the stochastic gravitational-wave background (SGWB) with existing GWPopulation models.
@@ -587,24 +536,14 @@ class Stochastic_Likelihood(Likelihood):
     """
     def __init__(
         self,
-        samples, stochastic_data,
+        stochastic_data,
         hyper_prior, # notice that we have to clearly specify the zmax of Redshift model in the hyper_prior.
-        wave_energies=None,
-        waveform_approximant="IMRPhenomD",
-        waveform_duration=10,
-        sampling_frequency=4096,
-        waveform_reference_frequency=25,
-        waveform_minimum_frequency=10,
-        multiprocess=True,
+        dEdf_freqs, draw_samples_kwargs,
         conversion_function=lambda args: (args, None),
     ):
         """
         Parameters
         ----------
-        samples: dict
-            Must contain at least ``mass_1``, ``mass_ratio``,``redshift`` and
-            ``luminosity_distance`` (removed later).  May contain a ``prior`` column
-            with the original proposal-prior values per sample.
         stochastic_data: dict
             Measured SGWB data.  Must contain:
  
@@ -614,25 +553,8 @@ class Stochastic_Likelihood(Likelihood):
 
         hyper_prior: `bilby.hyper.model.Model` or callable
             The population model (mass, spin, redshift, …).
-        wave_energies: array-like or None, optional
-            Pre-computed gravitational-wave energy spectra of shape
-            ``(N_samples, N_frequencies)``.  If *None* (the default) the
-            energies are computed automatically from ``samples`` using
-            the waveform configuration given below.
-        waveform_approximant: str, optional
-            LAL waveform approximant string,
-            Default ``"IMRPhenomD"``.
-        waveform_duration: float, optional
-            Duration in seconds for the waveform generator.  Default 10.
-        sampling_frequency: float, optional
-            Sampling frequency in Hz.  Default 4096.
-        waveform_reference_frequency: float, optional
-            Reference frequency in Hz.  Default 25.
-        waveform_minimum_frequency: float, optional
-            Minimum frequency in Hz.  Default 10.
-        multiprocess: bool, optional
-            Whether to use :mod:`multiprocessing` when computing wave
-            energies.  Default ``True``.
+        dEdf_freqs: 
+        drawn_samples_kwargs: 
         conversion_function: callable, optional
             Function that converts a dictionary of sampled parameters
             to a dictionary of population-model parameters.
@@ -649,183 +571,77 @@ class Stochastic_Likelihood(Likelihood):
             )
         self.hyper_prior = hyper_prior
         self.conversion_function = conversion_function
-        self.samples = samples.copy()
+
+        self.dEdf_freqs = dEdf_freqs
+        self.draw_samples_kwargs = draw_samples_kwargs
         #todo create another attribute to save redshift from samples input.
-        #! check it later.
-        self.samples_redshift = self.samples["redshift"]
+
         # after accesing luminosity information, that column should be removed from samples.
-        self.samples_default_luminosity_distance = self.samples.pop("luminosity_distance")
 
         # real measurements of the stochastic search.
         self.CIJ = stochastic_data["CIJ"]
         self.sigma = stochastic_data["sigma"]
         self.frequencies = stochastic_data["frequencies"]
 
-        if "prior" in self.samples:
-            self.sampling_prior = self.samples.pop("prior")
-        else:
-            logger.info("No prior values provided, defaulting to 1.")
-            self.sampling_prior = 1
-        
-        if wave_energies is not None:
-            self.wave_energies = xp.asarray(wave_energies)
-        else:
-            logger.info(
-                f"Computing wave energies for {self.n_samples} samples "
-                f"using waveform_approximant={waveform_approximant!r} "
-                f"(multiprocess={multiprocess})…"
-            )
-            self.wave_energies = self._calculate_wave_energies(
-                waveform_approximant=waveform_approximant,
-                waveform_duration=waveform_duration,
-                sampling_frequency=sampling_frequency,
-                waveform_reference_frequency=waveform_reference_frequency,
-                waveform_minimum_frequency=waveform_minimum_frequency,
-                multiprocess=multiprocess,
-            )
         
         super().__init__()
 
         # used for cosmological inference.
+
+        self._drawn_samples()
+        self._calculate_dEdf()
+
         self.cosmology_model = self._find_cosmo_model()
         self.redshift_model = self._find_redshift_model()
+        self.mass_function_model = self._find_mass_function_model()
+
         self._noise_log_likelihood = None
     
-    # -----------------------------------------------------------------
-    # Properties
-    # -----------------------------------------------------------------
-    @property
-    def n_samples(self):                                               
-        """Number of proposal samples."""
-        key = next(iter(self.samples))
-        return len(self.samples[key])
+    def _drawn_samples(self):
+        # initialize a dictionary of mass_1, mass_ratio, redshift for p(m1, q, z)
+        num_samples = int(self.draw_samples_kwargs['num_samples'])
 
-    # -----------------------------------------------------------------
-    # Wave-energy computation
-    # -----------------------------------------------------------------
-    def _calculate_wave_energies(
-        self,
-        waveform_approximant,
-        waveform_duration,
-        sampling_frequency,
-        waveform_reference_frequency,
-        waveform_minimum_frequency,
-        multiprocess,
-    ):
-        """
-        Compute :math:`|\\tilde{h}(f)|^2` for every proposal sample and
-        interpolate onto :attr:`self.frequencies`.
- 
-        Parameters
-        ----------
-        waveform_approximant: str
-        waveform_duration: float
-        sampling_frequency: float
-        waveform_reference_frequency: float
-        waveform_minimum_frequency: float
-        multiprocess: bool
- 
-        Returns
-        -------
-        wave_energies: np.ndarray, shape ``(N_samples, N_freq)``
-        """
-        import multiprocessing as mp
- 
-        import bilby
- 
-        lal_approximant = waveform_approximant
- 
-        # Build the bilby waveform generator (only needed for non-PC waveforms,
-        # we have redshift in our parameters!
-        waveform_generator = bilby.gw.WaveformGenerator(
-            duration=waveform_duration,
-            sampling_frequency=sampling_frequency,
-            frequency_domain_source_model=bilby.gw.source.lal_binary_black_hole,
-            parameter_conversion=bilby.gw.conversion.convert_to_lal_binary_black_hole_parameters,
-            waveform_arguments=dict(
-                waveform_approximant=lal_approximant,
-                reference_frequency=waveform_reference_frequency,
-                minimum_frequency=waveform_minimum_frequency,
-            ),
-        )
- 
-        target_frequencies = np.asarray(self.frequencies)
- 
-        # Build a list of single-event dictionaries and fill in required key-value pairs
-        inj_samples = self._build_injection_list()
- 
-        if multiprocess:
-            logger.info(
-                "Using multiprocessing to compute wave energies "
-                "(no progress bar)…"
-            )
-            args_list = [
-                (s, waveform_generator, target_frequencies)
-                for s in inj_samples
-            ]
-            with mp.Pool() as pool:
-                result = pool.map(_mp_worker, args_list)
-        else:
-            from tqdm.auto import tqdm
- 
-            result = [
-                _compute_single_wave_energy(
-                    s, waveform_generator, target_frequencies)
-                for s in tqdm(inj_samples, desc="Computing wave energies")
-            ]
-        return xp.asarray(result)
+        self.m1s_drawn = np.random.uniform(low=self.draw_samples_kwargs['ref_mMin'], high=self.draw_samples_kwargs['ref_mMax'], size=num_samples)
+        self.qs_drawn = np.random.uniform(low=0.01, high=1.0, size=int(num_samples))
+        self.m2s_drawn = self.m1s_drawn*self.qs_drawn
+        self.zs_drawn = np.random.uniform(low=0,high=self.draw_samples_kwargs['ref_zmax'],size=num_samples)
 
-    def _build_injection_list(self):
-        """
-        Convert the columnar ``self.samples`` dict into a list of
-        single-event dictionaries, one per proposal sample.
- 
-        Returns
-        -------
-        list[dict]
-        """
-        build_samples = self.samples.copy()
-        build_samples['mass_1_source'] = build_samples.pop('mass_1')
-        build_samples['mass_1_detector'] = build_samples['mass_1_source'] * (1. + build_samples['redshift'])
-        build_samples['mass_2_detector'] = build_samples['mass_1_detector'] * build_samples['mass_ratio']
+        self.mass_q_samples =  {'mass_1': self.m1s_drawn, 'mass_ratio': self.qs_drawn}
+        self.p_m1_q_z_drawn = np.ones(num_samples) * (1./ (self.draw_samples_kwargs['ref_mMax'] - self.draw_samples_kwargs['ref_mMin'])) * (1./ (1. - 0.01)) * (1./ self.draw_samples_kwargs['ref_zmax'])
+    
 
-        # build_samples is a dict contains `mass_1_source`, `mass_ratio`, `mass_1_detector`, `mass_2_detector`, `redshift`
-
-        keys = list(build_samples.keys())
-        n = self.n_samples
-        inj_samples = []
-        for i in range(n):
-            inj_samples.append(
-                {key: float(build_samples[key][i]) for key in keys}
-            )
-        
-        return inj_samples
+    def _calculate_dEdf(self):
+        num_samples = int(self.draw_samples_kwargs['num_samples'])
+        self.dEdfs = xp.asarray([dEdf(self.m1s_drawn[ii]+self.m2s_drawn[ii], self.dEdf_freqs*(1+self.zs_drawn[ii]),
+                       eta=self.m2s_drawn[ii]/self.m1s_drawn[ii]/(1+self.m2s_drawn[ii]/self.m1s_drawn[ii])**2) for ii in range(num_samples)])
 
 
     def _find_cosmo_model(self):
         """Find model in hyper_prior that has cosmology method."""
         for model in self.hyper_prior.models:
             if hasattr(model, "cosmology"):
+                logger.info("cosmology model found in hyper_prior.")
                 return model
-            else:
-                logger.info("No cosmology model found in hyper_prior, using default cosmology.")
+        logger.info("No cosmology model found in hyper_prior, using default cosmology.")
         return None
 
     def _find_redshift_model(self):
         """Find the redshift model in hyper_prior."""
         for model in self.hyper_prior.models:
             if isinstance(model, _Redshift):
+                logger.info("Redshift model found in hyper_prior.")
                 return model
-            else:
-                logger.info("No Redshift model found in hyper_prior, probably needs further check.")
+        logger.info("No Redshift model found in hyper_prior, probably needs further check.")
         return None
     
-    def get_luminosity_distance_from_cosmology_model(self, parameters):
-        """Get cosmology model from hyper_prior."""
-        if self.cosmology_model is not None:
-            return self.cosmology_model.cosmology(parameters).luminosity_distance(self.samples_redshift)
-        else:
-            return self.samples_default_luminosity_distance
+    def _find_mass_function_model(self):
+        """Find the mass function model in hyper_prior"""
+        for model in self.hyper_prior.models:
+            if isinstance(model, BaseSmoothedMassDistribution):
+                logger.info("mass function model found in hyper_prior")
+                return model
+        logger.info("No mass function model found in hyper_prior, probably needs further check.")
+        return None
     
     # -----------------------------------------------------------------
     # Extract H0 for the Omega_GW prefactor
@@ -864,9 +680,31 @@ class Stochastic_Likelihood(Likelihood):
             return float(H0_val.value) if hasattr(H0_val, "value") else float(H0_val)
  
         # 3) No cosmology information at all — use the default.
-        return None
+        return 67.74 # the default value from Planck15
 
 
+    def _get_function_parameters(self, func, **kwargs):
+        """
+        If the function is a class method we need to remove more arguments or
+        have the variable names provided in the class.
+        """
+        if hasattr(func, "variable_names"):
+            param_keys = func.variable_names
+        else:
+            param_keys = infer_args_from_function_except_n_args(func, n=0)
+            ignore = ["dataset", "data", "self", "cls"]
+            for key in ignore:
+                if key in param_keys:
+                    del param_keys[param_keys.index(key)]
+        parameters = dict()
+        for key in param_keys:
+            if key in kwargs:
+                parameters[key] = kwargs[key]
+            else:
+                raise KeyError(f"Missing parameter {key} for hyper model")
+        return parameters
+
+    
     # -----------------------------------------------------------------
     # Compute population weights
     # -----------------------------------------------------------------
@@ -894,13 +732,14 @@ class Stochastic_Likelihood(Likelihood):
         weights: array-like, shape ``(N_samples,)``
         """
         parameters, _ = self.conversion_function(parameters)
-        pop_prob = self.hyper_prior.prob(self.samples, **parameters)
-        weights = pop_prob / self.sampling_prior
- 
-        # Rescale for variable cosmology (dL_fid / dL_new)^2.
-        dL_new = self.get_luminosity_distance_from_cosmology_model(parameters)
-        dL_ratio = self.samples_default_luminosity_distance / dL_new
-        weights = weights * dL_ratio ** 2
+
+        mass_function_parameters = self._get_function_parameters(self.mass_function_model, **parameters)
+        pop_m1_q_prob = self.mass_function_model(self.mass_q_samples, **mass_function_parameters)
+
+        redshift_parameters = self._get_function_parameters(self.redshift_model, **parameters)
+        pop_z_prob = self.redshift_model.psi_of_z(self.zs_drawn, **redshift_parameters) / (1. + self.zs_drawn) * self.cosmology_model.cosmology(redshift_parameters).inv_efunc(self.zs_drawn)
+        
+        weights = pop_m1_q_prob * pop_z_prob / self.p_m1_q_z_drawn
  
         return weights
  
@@ -920,23 +759,19 @@ class Stochastic_Likelihood(Likelihood):
         -------
         omega: array-like, shape ``(N_freq,)``
         """
+
         weights = self._compute_weights(parameters)
  
-        # Rate normalisation:
-        #   R0 * int dz (dV/dz) (1+z)^{-1} psi(z) / 1e9
-        # The factor 1e9 converts the volume from Mpc^3 to Gpc^3.
-        if self.redshift_model is not None:
-            volume_norm = self.redshift_model.normalisation(parameters)
-        else:
-            volume_norm = 1.0
-        Rate_norm = parameters["rate"] * volume_norm / 1e9  # R0 - Gpc^{-3} yr^{-1}
+        Rate_norm = parameters["rate"]
 
         # Extract H0 for the Omega_GW prefactor.
         # When doing cosmological inference H0 is a sampled parameter
         # and must propagate into f^3 / H0^2.
         H0 = self._get_H0(parameters)
+
+        Omega_spectrum = _RhoC * Rate_norm * self.dEdf_freqs * xp.mean(self.dEdfs * weights[:, None], axis=0) / H0**3 / (365 * 24 * 3600) / 1e9
  
-        return omega_gw(self.frequencies, self.wave_energies, weights, Rate_norm, H0=H0) / (365 * 24 * 3600)  # convert from per year to per second
+        return xp.interp(self.frequencies, self.dEdf_freqs, Omega_spectrum)
 
     # -----------------------------------------------------------------
     # Gaussian log-likelihood
@@ -998,7 +833,7 @@ class Stochastic_Likelihood(Likelihood):
         return self.log_likelihood(parameters) - self.noise_log_likelihood()
 
 
-class JointCBCSGWBLikelihood(Likelihood):
+class JointCBCStochasticLikelihood(Likelihood):
     r"""
     Joint likelihood combining resolved CBC events and the stochastic
     gravitational-wave background.
