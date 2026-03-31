@@ -45,6 +45,7 @@ and can be calculated using :func:`gwpopulation.hyperpe.HyperparameterLikelihood
 import types
 
 import numpy as np
+from scipy import special as scs
 from bilby.core.likelihood import Likelihood
 from bilby.core.utils import logger, infer_args_from_function_except_n_args
 from bilby.hyper.model import Model
@@ -561,6 +562,8 @@ class StochasticLikelihood(Likelihood):
         stochastic_data,
         hyper_prior, # notice that we have to clearly specify the zmax of Redshift model in the hyper_prior.
         dEdf_freqs, draw_samples_kwargs,
+        calibration_epsilon=0,
+        frequency_mask=None,
         conversion_function=lambda args: (args, None),
     ):
         """
@@ -575,8 +578,19 @@ class StochasticLikelihood(Likelihood):
 
         hyper_prior: `bilby.hyper.model.Model` or callable
             The population model (mass, spin, redshift, …).
-        dEdf_freqs: 
-        drawn_samples_kwargs: 
+        dEdf_freqs: array-like
+            Coarse frequency grid on which dE/df is computed.
+        drawn_samples_kwargs: dict
+            Keyword arguments controlling the drawn Monte-Carlo samples.
+        calibration_epsilon: float, optional
+            Fractional calibration uncertainty.  When non-zero the
+            likelihood analytically marginalises over a calibration
+            amplitude following the pygwb convention.  Default is 0
+            (no calibration marginalisation).
+        frequency_mask: array-like of bool, optional
+            Boolean mask selecting which frequency bins enter the
+            likelihood sum.  ``True`` means the bin is included.
+            If *None* (default) the full frequency band is used.
         conversion_function: callable, optional
             Function that converts a dictionary of sampled parameters
             to a dictionary of population-model parameters.
@@ -595,8 +609,10 @@ class StochasticLikelihood(Likelihood):
         self.conversion_function = conversion_function
 
         self.dEdf_freqs = dEdf_freqs
-        self.draw_samples_kwargs = draw_samples_kwargs
-        #todo create another attribute to save redshift from samples input.
+        self.draw_samples_kwargs = draw_samples_kwargsx
+
+        # Calibration uncertainty
+        self.calibration_epsilon = calibration_epsilon
 
         # after accesing luminosity information, that column should be removed from samples.
 
@@ -604,6 +620,12 @@ class StochasticLikelihood(Likelihood):
         self.CIJ = stochastic_data["CIJ"]
         self.sigma = stochastic_data["sigma"]
         self.frequencies = stochastic_data["frequencies"]
+
+        # Frequency mask: True = include bin, default all bins.
+        if frequency_mask is not None:
+            self.frequency_mask = np.asarray(frequency_mask, dtype=bool)
+        else:
+            self.frequency_mask = np.ones(len(self.frequencies), dtype=bool)
 
         
         super().__init__()
@@ -622,16 +644,18 @@ class StochasticLikelihood(Likelihood):
         if self.cosmology_model is not None and hasattr(self.cosmology_model, '_cosmo'):
             cosmo = self.cosmology_model._cosmo
             if hasattr(cosmo, 'Om0'):
-                self._default_Om0 = float(cosmo.Om0) if not callable(cosmo.Om0) else 0.3065
+                self._default_Om0 = float(cosmo.Om0) if not callable(cosmo.Om0) else 0.3075
             else:
                 self._default_Om0 = 0.3065
             if hasattr(cosmo, 'w0'):
                 self._default_w0 = float(cosmo.w0) if not callable(cosmo.w0) else -1.0
             else:
                 self._default_w0 = -1.0
-            self._default_H0 = 67.74
+            if hasattr(cosmo, 'H0'): 
+                # when the cosmology is fixed, cosmo.H0 is a np array with shape (1,) and dtype float.
+                self._default_H0 = float(cosmo.H0) if hasattr(cosmo.H0, "dtype") else 67.74
         else:
-            self._default_Om0 = 0.3065
+            self._default_Om0 = 0.3075
             self._default_w0 = -1.0
             self._default_H0 = 67.74
 
@@ -749,6 +773,7 @@ class StochasticLikelihood(Likelihood):
  
         return weights
  
+
     # -----------------------------------------------------------------
     # Compute Omega_GW
     # -----------------------------------------------------------------
@@ -778,6 +803,189 @@ class StochasticLikelihood(Likelihood):
         Omega_spectrum = _RhoC * Rate_norm * self.dEdf_freqs * xp.mean(self.dEdfs * weights[:, None], axis=0) / H0**3 / (365 * 24 * 3600) / 1e9
  
         return xp.interp(self.frequencies, self.dEdf_freqs, Omega_spectrum)
+
+
+    # -----------------------------------------------------------------
+    # Compute full signal model  (Omega_GW + optional cosmological bkg)
+    # -----------------------------------------------------------------
+    def _compute_omega_model(self, parameters):
+        r"""
+        Compute the total signal model:
+ 
+        .. math::
+ 
+            \Omega_{\rm M}(f) = \Omega_{\rm GW}(f|\Lambda)
+                                + \Omega_c
+ 
+        where :math:`\Omega_c` is an optional frequency-independent
+        cosmological background.  If ``omega_c`` is not present in
+        *parameters* the second term is simply zero.
+ 
+        Parameters
+        ----------
+        parameters: dict
+ 
+        Returns
+        -------
+        omega_model: array-like, shape ``(N_freq,)``
+        """
+        omega = self._compute_omega_gw(parameters)
+        if "omega_c" in parameters:
+            omega = omega + parameters["omega_c"]
+        return omega
+
+
+    # -----------------------------------------------------------------
+    # Log-likelihood (pygwb-style, with optional calibration
+    # uncertainty marginalisation)
+    # -----------------------------------------------------------------
+    def log_likelihood(self, parameters):
+        r"""
+        Evaluate the log-likelihood of the data given the signal model.
+ 
+        **Simple likelihood** (``calibration_epsilon == 0``):
+ 
+        .. math::
+ 
+            \ln\mathcal{L} = -\frac{1}{2}\sum_k
+            \left[
+            \frac{\bigl(\hat{C}(f_k) - \Omega_M(f_k)\bigr)^2}{\sigma_k^2}
+            + \ln(2\pi\sigma_k^2)
+            \right]
+ 
+        **Calibration-marginalised likelihood**
+        (``calibration_epsilon > 0``, see
+        `pygwb <https://stochastic-alog.ligo.org/aLOG//index.php?callRep=339711>`_):
+ 
+        .. math::
+ 
+            \ln\mathcal{L} = \mathcal{N}
+            - \tfrac{1}{2}\ln(A\,\epsilon^2)
+            + \ln\!\bigl[1 + \mathrm{erf}(B/\sqrt{2A})\bigr]
+            - \ln\!\bigl[1 + \mathrm{erf}(1/\sqrt{2\epsilon^2})\bigr]
+            - \tfrac{1}{2}(C - B^2/A)
+ 
+        with
+ 
+        .. math::
+ 
+            A &= \epsilon^{-2} + \sum_k \Omega_M^2/\sigma_k^2 \\
+            B &= \epsilon^{-2} + \sum_k \Omega_M\,\hat{C}/\sigma_k^2 \\
+            C &= \epsilon^{-2} + \sum_k \hat{C}^2/\sigma_k^2
+ 
+        Parameters
+        ----------
+        parameters: dict
+ 
+        Returns
+        -------
+        float
+        """
+        omega_model = self._compute_omega_model(parameters)
+ 
+        CIJ = self.CIJ
+        sigma2 = self.sigma ** 2
+        mask = self.frequency_mask
+ 
+        if self.calibration_epsilon == 0:
+            logL = -0.5 * xp.sum(
+                (CIJ - omega_model) ** 2 / sigma2
+                + xp.log(2 * xp.pi * sigma2),
+                where=mask,
+                initial=0.0,
+            )
+        else:
+            eps = self.calibration_epsilon
+            eps2 = eps ** 2
+ 
+            A = 1.0 / eps2 + xp.sum(
+                omega_model ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            B = 1.0 / eps2 + xp.sum(
+                omega_model * CIJ / sigma2, where=mask, initial=0.0,
+            )
+            C = 1.0 / eps2 + xp.sum(
+                CIJ ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            log_norm = -0.5 * xp.sum(
+                xp.log(2 * xp.pi * sigma2), where=mask, initial=0.0,
+            )
+ 
+            logL = (
+                log_norm
+                - 0.5 * xp.log(A * eps2)
+                + xp.log(1.0 + scs.erf(B / xp.sqrt(2.0 * A)))
+                - xp.log(1.0 + scs.erf(1.0 / xp.sqrt(2.0 * eps2)))
+                - 0.5 * (C - B ** 2 / A)
+            )
+ 
+        return to_number(logL, float)
+ 
+    # -----------------------------------------------------------------
+    # Noise (null) log-likelihood
+    # -----------------------------------------------------------------
+    def noise_log_likelihood(self):
+        r"""
+        Log-likelihood under the null hypothesis
+        :math:`\Omega_{\rm M} = 0`.
+ 
+        Uses the same functional form as :meth:`log_likelihood` but
+        with the model set to zero, so the calibration path also
+        reduces correctly.
+ 
+        Returns
+        -------
+        float
+        """
+        if self._noise_log_likelihood is not None:
+            return self._noise_log_likelihood
+ 
+        CIJ = self.CIJ
+        sigma2 = self.sigma ** 2
+        mask = self.frequency_mask
+ 
+        if self.calibration_epsilon == 0:
+            noise_ll = -0.5 * xp.sum(
+                CIJ ** 2 / sigma2
+                + xp.log(2 * xp.pi * sigma2),
+                where=mask,
+                initial=0.0,
+            )
+        else:
+            eps = self.calibration_epsilon
+            eps2 = eps ** 2
+ 
+            # A = eps^{-2} (omega_model = 0)
+            A = 1.0 / eps2
+            B = 1.0 / eps2
+            C = 1.0 / eps2 + xp.sum(
+                CIJ ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            log_norm = -0.5 * xp.sum(
+                xp.log(2 * xp.pi * sigma2), where=mask, initial=0.0,
+            )
+            noise_ll = (
+                log_norm
+                - 0.5 * xp.log(A * eps2)
+                + xp.log(1.0 + scs.erf(B / xp.sqrt(2.0 * A)))
+                - xp.log(1.0 + scs.erf(1.0 / xp.sqrt(2.0 * eps2)))
+                - 0.5 * (C - B ** 2 / A)
+            )
+ 
+        self._noise_log_likelihood = to_number(noise_ll, float)
+        return self._noise_log_likelihood
+ 
+    # -----------------------------------------------------------------
+    # Log-likelihood ratio
+    # -----------------------------------------------------------------
+    def log_likelihood_ratio(self, parameters):
+        """
+        Returns ``log_likelihood - noise_log_likelihood``.
+        """
+        return self.log_likelihood(parameters) - self.noise_log_likelihood()
+
+
+
 
     # -----------------------------------------------------------------
     # Gaussian log-likelihood
