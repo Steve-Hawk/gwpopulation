@@ -59,6 +59,28 @@ xp = np
 __all__ = ["HyperparameterLikelihood", "RateLikelihood", "LocalMergerRateLikelihood", "StochasticLikelihood", "JointCBCStochasticLikelihood", "xp"]
 
 
+def _inv_efunc_flat_wcdm(z, Om0, w0=-1.0):
+    r"""
+    Standalone inverse E(z) for a flat :math:`w\mathrm{CDM}` cosmology:
+ 
+    .. math::
+ 
+        E^{-1}(z) = \left[\Omega_{m,0}(1+z)^3
+                     + (1 - \Omega_{m,0})(1+z)^{3(1+w_0)}\right]^{-1/2}
+ 
+    When :math:`w_0 = -1` this reduces to flat :math:`\Lambda\mathrm{CDM}`.
+ 
+    This is a pure-arithmetic function with no data-dependent branches,
+    making it safe for use inside :func:`jax.jit`-traced code.  It
+    replaces the call to ``wcosmo``'s :meth:`inv_efunc`, which triggers
+    ``TracerArrayConversionError`` because of internal ``if`` branches on
+    the value of ``Om0``.
+    """
+    zp1 = 1.0 + z
+    return (Om0 * zp1 ** 3 + (1.0 - Om0) * zp1 ** (3.0 * (1.0 + w0))) ** (-0.5)
+
+
+
 class HyperparameterLikelihood(Likelihood):
     """
     A likelihood for inferring hyperparameter posterior distributions with
@@ -595,6 +617,27 @@ class StochasticLikelihood(Likelihood):
         self.redshift_model = self._find_redshift_model()
         self.mass_function_model = self._find_mass_function_model()
 
+        # Cache default Om0 and w0 for fixed-cosmology runs so that
+        # _compute_weights can fall back when these are not sampled parameters.
+        if self.cosmology_model is not None and hasattr(self.cosmology_model, '_cosmo'):
+            cosmo = self.cosmology_model._cosmo
+            if hasattr(cosmo, 'Om0'):
+                self._default_Om0 = float(cosmo.Om0) if not callable(cosmo.Om0) else 0.3065
+            else:
+                self._default_Om0 = 0.3065
+            if hasattr(cosmo, 'w0'):
+                self._default_w0 = float(cosmo.w0) if not callable(cosmo.w0) else -1.0
+            else:
+                self._default_w0 = -1.0
+            if hasattr(cosmo, 'H0'):
+                self._default_H0 = float(cosmo.H0) if not callable(cosmo.H0) else 67.74
+            else:
+                self._default_H0 = 67.74
+        else:
+            self._default_Om0 = 0.3065
+            self._default_w0 = -1.0
+            self._default_H0 = 67.74
+
         self._noise_log_likelihood = None
     
     def _drawn_samples(self):
@@ -642,46 +685,6 @@ class StochasticLikelihood(Likelihood):
                 return model
         logger.info("No mass function model found in hyper_prior, probably needs further check.")
         return None
-    
-    # -----------------------------------------------------------------
-    # Extract H0 for the Omega_GW prefactor
-    # -----------------------------------------------------------------
-    def _get_H0(self, parameters):
-        r"""
-        Return the current Hubble constant in km/s/Mpc, or *None* if the
-        cosmology is fixed (in which case :func:`omega_gw` will use its
-        built-in Planck15 default).
- 
-        For variable-cosmology runs (``FlatLambdaCDM``, ``FlatwCDM``)
-        the sampled ``H0`` is read directly from *parameters*.
-        For fixed-cosmology runs with a cosmology model present the
-        value is read from the model's cosmology object.
-        If no cosmology model exists at all, *None* is returned.
- 
-        Parameters
-        ----------
-        parameters: dict
- 
-        Returns
-        -------
-        H0: float or None
-            Hubble constant in km/s/Mpc, or None for the default.
-        """
-        # 1) Variable cosmology: H0 is a sampled parameter.
-        if "H0" in parameters:
-            return float(parameters["H0"])
- 
-        # 2) Fixed cosmology model present: read H0 from the model.
-        if self.cosmology_model is not None:
-            cosmo = self.cosmology_model.cosmology(parameters)
-            # wcosmo with units disabled returns a bare float (km/s/Mpc);
-            # with units enabled it returns an astropy Quantity.
-            H0_val = cosmo.H0
-            return float(H0_val.value) if hasattr(H0_val, "value") else float(H0_val)
- 
-        # 3) No cosmology information at all — use the default.
-        return 67.74 # the default value from Planck15
-
 
     def _get_function_parameters(self, func, **kwargs):
         """
@@ -737,7 +740,13 @@ class StochasticLikelihood(Likelihood):
         pop_m1_q_prob = self.mass_function_model(self.mass_q_samples, **mass_function_parameters)
 
         redshift_parameters = self._get_function_parameters(self.redshift_model, **parameters)
-        pop_z_prob = self.redshift_model.psi_of_z(self.zs_drawn, **redshift_parameters) / (1. + self.zs_drawn) * self.cosmology_model.cosmology(redshift_parameters).inv_efunc(self.zs_drawn)
+        Om0 = parameters["Om0"] if "Om0" in parameters else self._default_Om0
+        w0 = parameters["w0"] if "w0" in parameters else self._default_w0
+        pop_z_prob = (
+            self.redshift_model.psi_of_z(self.zs_drawn, **redshift_parameters)
+            / (1.0 + self.zs_drawn)
+            * _inv_efunc_flat_wcdm(self.zs_drawn, Om0, w0)
+        )
         
         weights = pop_m1_q_prob * pop_z_prob / self.p_m1_q_z_drawn
  
@@ -767,7 +776,7 @@ class StochasticLikelihood(Likelihood):
         # Extract H0 for the Omega_GW prefactor.
         # When doing cosmological inference H0 is a sampled parameter
         # and must propagate into f^3 / H0^2.
-        H0 = self._get_H0(parameters)
+        H0 = parameters["H0"] if "H0" in parameters else self._default_H0
 
         Omega_spectrum = _RhoC * Rate_norm * self.dEdf_freqs * xp.mean(self.dEdfs * weights[:, None], axis=0) / H0**3 / (365 * 24 * 3600) / 1e9
  
