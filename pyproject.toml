@@ -55,3 +55,4 @@ gwpopulation_cosmo = "gwpopulation.experimental.cosmo_models"
 [project.entry-points."gwpopulation.scs"]
 gwpopulation_mass = "gwpopulation.models.mass"
 gwpopulation_utils = "gwpopulation.utils"
+gwpopulation_hyperpe = "gwpopulation.hyperpe"
