@@ -51,7 +51,7 @@ from bilby.hyper.model import Model
 
 from .utils import get_name, to_number, to_numpy
 from .models.redshift import _Redshift
-from .experimental.sgwb_utils import wave_energy, omega_gw
+from .experimental.sgwb_utils import omega_gw
 
 xp = np
 
@@ -525,58 +525,6 @@ class LocalMergerRateLikelihood(HyperparameterLikelihood):
             return total_selection
 
 
-def _compute_single_wave_energy(
-    inj_sample, waveform_generator, target_frequencies):
-    """
-    Module-level helper that computes the wave energy spectrum for a
-    single injection sample.  Kept at module level so that it is
-    pickle-able for :mod:`multiprocessing`.
- 
-    Missing waveform parameters (``phase``, ``theta_jn``, spins) are
-    filled with isotropic/zero defaults.
- 
-    Parameters
-    ----------
-    inj_sample: dict
-        Single-event parameter dictionary.
-    waveform_generator: bilby.gw.WaveformGenerator
-        The waveform generator instance.
-    target_frequencies: np.ndarray
-        The frequency grid to interpolate onto.
-    use_approxed_waveform: bool
-        Whether to use the piecewise-closed-form amplitude approximation.
-    inspiral_only: bool
-        If ``use_approxed_waveform`` is True, whether to truncate at ISCO.
- 
-    Returns
-    -------
-    np.ndarray
-        The wave energy spectrum interpolated onto *target_frequencies*.
-    """
-    # Fill defaults for orientation / spin parameters that may be absent.
-    if "phase" not in inj_sample:
-        inj_sample["phase"] = 2 * np.pi * np.random.rand()
-    if "theta_jn" not in inj_sample:
-        inj_sample["theta_jn"] = np.arccos(np.random.rand() * 2.0 - 1.0)
-    # we don't expect the spins to have a significant effect on the SGWB, so we can just set them to zero in most cases.
-    for key in ("a_1", "a_2", "tilt_1", "tilt_2"):
-        if key not in inj_sample:
-            inj_sample[key] = 0
- 
-    waveform_frequencies = waveform_generator.frequency_array
-    wave_en = wave_energy(
-        waveform_generator,
-        inj_sample
-    )
-    return np.interp(target_frequencies, waveform_frequencies, wave_en)
-
-
-def _mp_worker(args):
-    """Thin wrapper so that :func:`multiprocessing.Pool.map` can call
-    :func:`_compute_single_wave_energy` with a single tuple argument."""
-    return _compute_single_wave_energy(*args)
-
-
 class Stochastic_Likelihood(Likelihood):
     """
     A likelihood for inferring hyperparameter posterior distributions
@@ -589,13 +537,10 @@ class Stochastic_Likelihood(Likelihood):
         self,
         samples, stochastic_data,
         hyper_prior, # notice that we have to clearly specify the zmax of Redshift model in the hyper_prior.
-        wave_energies=None,
-        waveform_approximant="IMRPhenomD",
-        waveform_duration=10,
-        sampling_frequency=4096,
-        waveform_reference_frequency=25,
-        waveform_minimum_frequency=10,
-        multiprocess=True,
+        include_inc=True,
+        wave_energies=None, wave_energies_freqs=None,
+        calibration_epsilon=0,
+        frequency_mask=None,
         conversion_function=lambda args: (args, None),
     ):
         """
@@ -614,25 +559,24 @@ class Stochastic_Likelihood(Likelihood):
 
         hyper_prior: `bilby.hyper.model.Model` or callable
             The population model (mass, spin, redshift, …).
+        include_inc: Bool
+            whether wave_energies include inclination parameter.
         wave_energies: array-like or None, optional
             Pre-computed gravitational-wave energy spectra of shape
             ``(N_samples, N_frequencies)``.  If *None* (the default) the
             energies are computed automatically from ``samples`` using
             the waveform configuration given below.
-        waveform_approximant: str, optional
-            LAL waveform approximant string,
-            Default ``"IMRPhenomD"``.
-        waveform_duration: float, optional
-            Duration in seconds for the waveform generator.  Default 10.
-        sampling_frequency: float, optional
-            Sampling frequency in Hz.  Default 4096.
-        waveform_reference_frequency: float, optional
-            Reference frequency in Hz.  Default 25.
-        waveform_minimum_frequency: float, optional
-            Minimum frequency in Hz.  Default 10.
-        multiprocess: bool, optional
-            Whether to use :mod:`multiprocessing` when computing wave
-            energies.  Default ``True``.
+        wave_energies_freqs: array-like
+            ``(N_frequencies)``. match wave_energies
+        calibration_epsilon: float, optional
+            Fractional calibration uncertainty.  When non-zero the
+            likelihood analytically marginalises over a calibration
+            amplitude following the pygwb convention.  Default is 0
+            (no calibration marginalisation).
+        frequency_mask: array-like of bool, optional
+            Boolean mask selecting which frequency bins enter the
+            likelihood sum.  ``True`` means the bin is included.
+            If *None* (default) the full frequency band is used.
         conversion_function: callable, optional
             Function that converts a dictionary of sampled parameters
             to a dictionary of population-model parameters.
@@ -648,6 +592,10 @@ class Stochastic_Likelihood(Likelihood):
                 "or a class with attribute 'parameters' and method 'prob'"
             )
         self.hyper_prior = hyper_prior
+        if include_inc:
+            self.prefactor = 1
+        else:
+            self.prefactor = 4./5
         self.conversion_function = conversion_function
         self.samples = samples.copy()
         #todo create another attribute to save redshift from samples input.
@@ -656,11 +604,20 @@ class Stochastic_Likelihood(Likelihood):
         # after accesing luminosity information, that column should be removed from samples.
         self.samples_default_luminosity_distance = self.samples.pop("luminosity_distance")
 
+        # Calibration uncertainty
+        self.calibration_epsilon = calibration_epsilon
+
         # real measurements of the stochastic search.
         self.CIJ = stochastic_data["CIJ"]
         self.sigma = stochastic_data["sigma"]
         self.frequencies = stochastic_data["frequencies"]
 
+        # Frequency mask: True = include bin, default all bins.
+        if frequency_mask is not None:
+            self.frequency_mask = np.asarray(frequency_mask, dtype=bool)
+        else:
+            self.frequency_mask = np.ones(len(self.frequencies), dtype=bool)
+        
         if "prior" in self.samples:
             self.sampling_prior = self.samples.pop("prior")
         else:
@@ -669,26 +626,23 @@ class Stochastic_Likelihood(Likelihood):
         
         if wave_energies is not None:
             self.wave_energies = xp.asarray(wave_energies)
+            self.wave_energies_freqs = xp.asarray(wave_energies_freqs)
         else:
-            logger.info(
-                f"Computing wave energies for {self.n_samples} samples "
-                f"using waveform_approximant={waveform_approximant!r} "
-                f"(multiprocess={multiprocess})…"
-            )
-            self.wave_energies = self._calculate_wave_energies(
-                waveform_approximant=waveform_approximant,
-                waveform_duration=waveform_duration,
-                sampling_frequency=sampling_frequency,
-                waveform_reference_frequency=waveform_reference_frequency,
-                waveform_minimum_frequency=waveform_minimum_frequency,
-                multiprocess=multiprocess,
-            )
+            logger.info("please give wave energies as input.")
         
         super().__init__()
 
         # used for cosmological inference.
         self.cosmology_model = self._find_cosmo_model()
         self.redshift_model = self._find_redshift_model()
+
+        if self.cosmology_model is not None and hasattr(self.cosmology_model, '_cosmo'):
+            if hasattr(cosmo, 'H0'): 
+                # when the cosmology is fixed, cosmo.H0 is a np array with shape (1,) and dtype float.
+                self._default_H0 = float(cosmo.H0) if hasattr(cosmo.H0, "dtype") else 67.74
+        else:
+            self._default_H0 = 67.74
+
         self._noise_log_likelihood = None
     
     # -----------------------------------------------------------------
@@ -699,107 +653,6 @@ class Stochastic_Likelihood(Likelihood):
         """Number of proposal samples."""
         key = next(iter(self.samples))
         return len(self.samples[key])
-
-    # -----------------------------------------------------------------
-    # Wave-energy computation
-    # -----------------------------------------------------------------
-    def _calculate_wave_energies(
-        self,
-        waveform_approximant,
-        waveform_duration,
-        sampling_frequency,
-        waveform_reference_frequency,
-        waveform_minimum_frequency,
-        multiprocess,
-    ):
-        """
-        Compute :math:`|\\tilde{h}(f)|^2` for every proposal sample and
-        interpolate onto :attr:`self.frequencies`.
- 
-        Parameters
-        ----------
-        waveform_approximant: str
-        waveform_duration: float
-        sampling_frequency: float
-        waveform_reference_frequency: float
-        waveform_minimum_frequency: float
-        multiprocess: bool
- 
-        Returns
-        -------
-        wave_energies: np.ndarray, shape ``(N_samples, N_freq)``
-        """
-        import multiprocessing as mp
- 
-        import bilby
- 
-        lal_approximant = waveform_approximant
- 
-        # Build the bilby waveform generator (only needed for non-PC waveforms,
-        # we have redshift in our parameters!
-        waveform_generator = bilby.gw.WaveformGenerator(
-            duration=waveform_duration,
-            sampling_frequency=sampling_frequency,
-            frequency_domain_source_model=bilby.gw.source.lal_binary_black_hole,
-            parameter_conversion=bilby.gw.conversion.convert_to_lal_binary_black_hole_parameters,
-            waveform_arguments=dict(
-                waveform_approximant=lal_approximant,
-                reference_frequency=waveform_reference_frequency,
-                minimum_frequency=waveform_minimum_frequency,
-            ),
-        )
- 
-        target_frequencies = np.asarray(self.frequencies)
- 
-        # Build a list of single-event dictionaries and fill in required key-value pairs
-        inj_samples = self._build_injection_list()
- 
-        if multiprocess:
-            logger.info(
-                "Using multiprocessing to compute wave energies "
-                "(no progress bar)…"
-            )
-            args_list = [
-                (s, waveform_generator, target_frequencies)
-                for s in inj_samples
-            ]
-            with mp.Pool() as pool:
-                result = pool.map(_mp_worker, args_list)
-        else:
-            from tqdm.auto import tqdm
- 
-            result = [
-                _compute_single_wave_energy(
-                    s, waveform_generator, target_frequencies)
-                for s in tqdm(inj_samples, desc="Computing wave energies")
-            ]
-        return xp.asarray(result)
-
-    def _build_injection_list(self):
-        """
-        Convert the columnar ``self.samples`` dict into a list of
-        single-event dictionaries, one per proposal sample.
- 
-        Returns
-        -------
-        list[dict]
-        """
-        build_samples = self.samples.copy()
-        build_samples['mass_1_source'] = build_samples.pop('mass_1')
-        build_samples['mass_1_detector'] = build_samples['mass_1_source'] * (1. + build_samples['redshift'])
-        build_samples['mass_2_detector'] = build_samples['mass_1_detector'] * build_samples['mass_ratio']
-
-        # build_samples is a dict contains `mass_1_source`, `mass_ratio`, `mass_1_detector`, `mass_2_detector`, `redshift`
-
-        keys = list(build_samples.keys())
-        n = self.n_samples
-        inj_samples = []
-        for i in range(n):
-            inj_samples.append(
-                {key: float(build_samples[key][i]) for key in keys}
-            )
-        
-        return inj_samples
 
 
     def _find_cosmo_model(self):
@@ -826,46 +679,6 @@ class Stochastic_Likelihood(Likelihood):
             return self.cosmology_model.cosmology(parameters).luminosity_distance(self.samples_redshift)
         else:
             return self.samples_default_luminosity_distance
-    
-    # -----------------------------------------------------------------
-    # Extract H0 for the Omega_GW prefactor
-    # -----------------------------------------------------------------
-    def _get_H0(self, parameters):
-        r"""
-        Return the current Hubble constant in km/s/Mpc, or *None* if the
-        cosmology is fixed (in which case :func:`omega_gw` will use its
-        built-in Planck15 default).
- 
-        For variable-cosmology runs (``FlatLambdaCDM``, ``FlatwCDM``)
-        the sampled ``H0`` is read directly from *parameters*.
-        For fixed-cosmology runs with a cosmology model present the
-        value is read from the model's cosmology object.
-        If no cosmology model exists at all, *None* is returned.
- 
-        Parameters
-        ----------
-        parameters: dict
- 
-        Returns
-        -------
-        H0: float or None
-            Hubble constant in km/s/Mpc, or None for the default.
-        """
-        # 1) Variable cosmology: H0 is a sampled parameter.
-        if "H0" in parameters:
-            return float(parameters["H0"])
- 
-        # 2) Fixed cosmology model present: read H0 from the model.
-        if self.cosmology_model is not None:
-            cosmo = self.cosmology_model.cosmology(parameters)
-            # wcosmo with units disabled returns a bare float (km/s/Mpc);
-            # with units enabled it returns an astropy Quantity.
-            H0_val = cosmo.H0
-            return float(H0_val.value) if hasattr(H0_val, "value") else float(H0_val)
- 
-        # 3) No cosmology information at all — use the default.
-        return None
-
 
     # -----------------------------------------------------------------
     # Compute population weights
@@ -933,23 +746,78 @@ class Stochastic_Likelihood(Likelihood):
 
         # Extract H0 for the Omega_GW prefactor.
         # When doing cosmological inference H0 is a sampled parameter
-        # and must propagate into f^3 / H0^2.
-        H0 = self._get_H0(parameters)
+        H0 = parameters["H0"] if "H0" in parameters else self._default_H0
  
-        return omega_gw(self.frequencies, self.wave_energies, weights, Rate_norm, H0=H0) / (365 * 24 * 3600)  # convert from per year to per second
+        Omega_spectrum = self.prefactor * omega_gw(self.wave_energies_freqs, self.wave_energies, weights, Rate_norm, H0=H0) / (365 * 24 * 3600)  # convert from per year to per second
+
+        return xp.interp(self.frequencies, self.wave_energies_freqs, Omega_spectrum)
 
     # -----------------------------------------------------------------
-    # Gaussian log-likelihood
+    # Compute full signal model  (Omega_GW + optional cosmological bkg)
     # -----------------------------------------------------------------
-    def log_likelihood(self, parameters):
+    def _compute_omega_model(self, parameters):
         r"""
-        Evaluate the Gaussian log-likelihood:
+        Compute the total signal model:
  
         .. math::
  
-            \ln \mathcal{L} = -\frac{1}{2}\sum_k
-            \frac{\bigl(\hat{C}_{IJ}(f_k) -
-            \Omega_{\rm GW}(f_k|\Lambda)\bigr)^2}{\sigma_k^2}
+            \Omega_{\rm M}(f) = \Omega_{\rm GW}(f|\Lambda)
+                                + \Omega_c
+ 
+        where :math:`\Omega_c` is an optional frequency-independent
+        cosmological background.  If ``omega_c`` is not present in
+        *parameters* the second term is simply zero.
+ 
+        Parameters
+        ----------
+        parameters: dict
+ 
+        Returns
+        -------
+        omega_model: array-like, shape ``(N_freq,)``
+        """
+        omega = self._compute_omega_gw(parameters)
+        if "omega_c" in parameters:
+            omega = omega + parameters["omega_c"]
+        return omega
+
+    # -----------------------------------------------------------------
+    # Log-likelihood (pygwb-style, with optional calibration
+    # uncertainty marginalisation)
+    # -----------------------------------------------------------------
+    def log_likelihood(self, parameters):
+        r"""
+        Evaluate the log-likelihood of the data given the signal model.
+ 
+        **Simple likelihood** (``calibration_epsilon == 0``):
+ 
+        .. math::
+ 
+            \ln\mathcal{L} = -\frac{1}{2}\sum_k
+            \left[
+            \frac{\bigl(\hat{C}(f_k) - \Omega_M(f_k)\bigr)^2}{\sigma_k^2}
+            + \ln(2\pi\sigma_k^2)
+            \right]
+ 
+        **Calibration-marginalised likelihood**
+        (``calibration_epsilon > 0``, see
+        `pygwb <https://stochastic-alog.ligo.org/aLOG//index.php?callRep=339711>`_):
+ 
+        .. math::
+ 
+            \ln\mathcal{L} = \mathcal{N}
+            - \tfrac{1}{2}\ln(A\,\epsilon^2)
+            + \ln\!\bigl[1 + \mathrm{erf}(B/\sqrt{2A})\bigr]
+            - \ln\!\bigl[1 + \mathrm{erf}(1/\sqrt{2\epsilon^2})\bigr]
+            - \tfrac{1}{2}(C - B^2/A)
+ 
+        with
+ 
+        .. math::
+ 
+            A &= \epsilon^{-2} + \sum_k \Omega_M^2/\sigma_k^2 \\
+            B &= \epsilon^{-2} + \sum_k \Omega_M\,\hat{C}/\sigma_k^2 \\
+            C &= \epsilon^{-2} + \sum_k \hat{C}^2/\sigma_k^2
  
         Parameters
         ----------
@@ -959,11 +827,45 @@ class Stochastic_Likelihood(Likelihood):
         -------
         float
         """
-        omega = self._compute_omega_gw(parameters)
-        residual = self.CIJ - omega
-        return to_number(
-            -0.5 * xp.sum(residual ** 2 / self.sigma ** 2), float
-        )
+        omega_model = self._compute_omega_model(parameters)
+ 
+        CIJ = self.CIJ
+        sigma2 = self.sigma ** 2
+        mask = self.frequency_mask
+ 
+        if self.calibration_epsilon == 0:
+            logL = -0.5 * xp.sum(
+                (CIJ - omega_model) ** 2 / sigma2
+                + xp.log(2 * xp.pi * sigma2),
+                where=mask,
+                initial=0.0,
+            )
+        else:
+            eps = self.calibration_epsilon
+            eps2 = eps ** 2
+ 
+            A = 1.0 / eps2 + xp.sum(
+                omega_model ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            B = 1.0 / eps2 + xp.sum(
+                omega_model * CIJ / sigma2, where=mask, initial=0.0,
+            )
+            C = 1.0 / eps2 + xp.sum(
+                CIJ ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            log_norm = -0.5 * xp.sum(
+                xp.log(2 * xp.pi * sigma2), where=mask, initial=0.0,
+            )
+ 
+            logL = (
+                log_norm
+                - 0.5 * xp.log(A * eps2)
+                + xp.log(1.0 + scs.erf(B / xp.sqrt(2.0 * A)))
+                - xp.log(1.0 + scs.erf(1.0 / xp.sqrt(2.0 * eps2)))
+                - 0.5 * (C - B ** 2 / A)
+            )
+ 
+        return to_number(logL, float)
  
     # -----------------------------------------------------------------
     # Noise (null) log-likelihood
@@ -971,21 +873,52 @@ class Stochastic_Likelihood(Likelihood):
     def noise_log_likelihood(self):
         r"""
         Log-likelihood under the null hypothesis
-        :math:`\Omega_{\rm GW} = 0`:
+        :math:`\Omega_{\rm M} = 0`.
  
-        .. math::
- 
-            \ln \mathcal{L}_0 = -\frac{1}{2}\sum_k
-            \frac{\hat{C}_{IJ}(f_k)^2}{\sigma_k^2}
+        Uses the same functional form as :meth:`log_likelihood` but
+        with the model set to zero, so the calibration path also
+        reduces correctly.
  
         Returns
         -------
         float
         """
-        if self._noise_log_likelihood is None:
-            self._noise_log_likelihood = to_number(
-                -0.5 * xp.sum(self.CIJ ** 2 / self.sigma ** 2), float
+        if self._noise_log_likelihood is not None:
+            return self._noise_log_likelihood
+ 
+        CIJ = self.CIJ
+        sigma2 = self.sigma ** 2
+        mask = self.frequency_mask
+ 
+        if self.calibration_epsilon == 0:
+            noise_ll = -0.5 * xp.sum(
+                CIJ ** 2 / sigma2
+                + xp.log(2 * xp.pi * sigma2),
+                where=mask,
+                initial=0.0,
             )
+        else:
+            eps = self.calibration_epsilon
+            eps2 = eps ** 2
+ 
+            # A = eps^{-2} (omega_model = 0)
+            A = 1.0 / eps2
+            B = 1.0 / eps2
+            C = 1.0 / eps2 + xp.sum(
+                CIJ ** 2 / sigma2, where=mask, initial=0.0,
+            )
+            log_norm = -0.5 * xp.sum(
+                xp.log(2 * xp.pi * sigma2), where=mask, initial=0.0,
+            )
+            noise_ll = (
+                log_norm
+                - 0.5 * xp.log(A * eps2)
+                + xp.log(1.0 + scs.erf(B / xp.sqrt(2.0 * A)))
+                - xp.log(1.0 + scs.erf(1.0 / xp.sqrt(2.0 * eps2)))
+                - 0.5 * (C - B ** 2 / A)
+            )
+ 
+        self._noise_log_likelihood = to_number(noise_ll, float)
         return self._noise_log_likelihood
  
     # -----------------------------------------------------------------
