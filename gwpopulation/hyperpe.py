@@ -985,68 +985,6 @@ class StochasticLikelihood(Likelihood):
         return self.log_likelihood(parameters) - self.noise_log_likelihood()
 
 
-
-
-    # -----------------------------------------------------------------
-    # Gaussian log-likelihood
-    # -----------------------------------------------------------------
-    def log_likelihood(self, parameters):
-        r"""
-        Evaluate the Gaussian log-likelihood:
- 
-        .. math::
- 
-            \ln \mathcal{L} = -\frac{1}{2}\sum_k
-            \frac{\bigl(\hat{C}_{IJ}(f_k) -
-            \Omega_{\rm GW}(f_k|\Lambda)\bigr)^2}{\sigma_k^2}
- 
-        Parameters
-        ----------
-        parameters: dict
- 
-        Returns
-        -------
-        float
-        """
-        omega = self._compute_omega_gw(parameters)
-        residual = self.CIJ - omega
-        return to_number(
-            -0.5 * xp.sum(residual ** 2 / self.sigma ** 2), float
-        )
- 
-    # -----------------------------------------------------------------
-    # Noise (null) log-likelihood
-    # -----------------------------------------------------------------
-    def noise_log_likelihood(self):
-        r"""
-        Log-likelihood under the null hypothesis
-        :math:`\Omega_{\rm GW} = 0`:
- 
-        .. math::
- 
-            \ln \mathcal{L}_0 = -\frac{1}{2}\sum_k
-            \frac{\hat{C}_{IJ}(f_k)^2}{\sigma_k^2}
- 
-        Returns
-        -------
-        float
-        """
-        if self._noise_log_likelihood is None:
-            self._noise_log_likelihood = to_number(
-                -0.5 * xp.sum(self.CIJ ** 2 / self.sigma ** 2), float
-            )
-        return self._noise_log_likelihood
- 
-    # -----------------------------------------------------------------
-    # Log-likelihood ratio
-    # -----------------------------------------------------------------
-    def log_likelihood_ratio(self, parameters):
-        """
-        Returns ``log_likelihood - noise_log_likelihood``.
-        """
-        return self.log_likelihood(parameters) - self.noise_log_likelihood()
-
-
 class JointCBCStochasticLikelihood(Likelihood):
     r"""
     Joint likelihood combining resolved CBC events and the stochastic
