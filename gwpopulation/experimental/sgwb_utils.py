@@ -38,41 +38,7 @@ light_speed = c.value
 m_sun = 1.99e30 #kg
 G = 6.67e-11 #N*m^2/kg^2
 mass_to_seconds_conv = G/light_speed**3
- 
-def wave_energy(waveform_generator, injection_parameters):
-    """
-    Compute the GW energy for a given waveform and set of parameters.
- 
-    Parameters
-    =======
-    waveform_generator: bilby waveform generator object
-        Waveform generator for a specific waveform and set of time/frequency parameters.
-    injection_parameters: dict
-        Dictionary of individual GW parameters.
- 
-    Returns
-    =======
-    The wave energy spectrum in a np.array.
-    """
-    
-    try:
-        #set optimal waveform duration
-        waveform_generator.waveform_duration = bilby.gw.utils.calculate_time_to_merger(waveform_generator.waveform_arguments['minimum_frequency'], injection_parameters['mass_1_detector'], injection_parameters['mass_2_detector'])
-    except KeyError:
-        pass
-    
-    try:                                                        # FIX #11: catch only Exception, log useful info
-        polarizations = waveform_generator.frequency_domain_strain(injection_parameters)
-        # Could make this into a FrequencySeries...
-        return (np.abs(polarizations['plus'])**2 + np.abs(polarizations['cross'])**2)
-    except Exception as exc:
-        logger.warning(
-            "wave_energy: waveform generation failed for sample "
-            f"(m1_det={injection_parameters.get('mass_1_detector', '?')}, "
-            f"m2_det={injection_parameters.get('mass_2_detector', '?')}): {exc}"
-        )
-        return np.zeros_like(waveform_generator.frequency_array)
-    
+
 def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
     """
     Compute Omega GW spectrum given a set of wave energy spectra and associated weights.
