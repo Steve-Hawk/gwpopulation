@@ -51,6 +51,7 @@ gwpopulation_spin = "gwpopulation.models.spin"
 gwpopulation_utils = "gwpopulation.utils"
 gwpopulation_vt = "gwpopulation.vt"
 gwpopulation_cosmo = "gwpopulation.experimental.cosmo_models"
+gwpopulation_sgwb_utils = "gwpopulation.experimental.sgwb_utils"
 
 [project.entry-points."gwpopulation.scs"]
 gwpopulation_mass = "gwpopulation.models.mass"
