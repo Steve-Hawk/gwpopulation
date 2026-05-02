@@ -74,7 +74,7 @@ def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
     # highvals = np.sort(weights)[-10:]
     # weights[weights==highvals]=0
     N_samples = len(weights)
-    # weights shape (N_samples,), wave_energies shape (freq_grids, N_samples)
-    weighted_energy = np.nansum(weights * wave_energies, axis=1) / N_samples
+    # weights shape (N_samples,), wave_energies shape (N_samples, freq_grids)
+    weighted_energy = np.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
  
     return Rate_norm * conv * weighted_energy
