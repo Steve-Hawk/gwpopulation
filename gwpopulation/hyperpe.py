@@ -637,6 +637,7 @@ class Stochastic_Likelihood(Likelihood):
         self.redshift_model = self._find_redshift_model()
 
         if self.cosmology_model is not None and hasattr(self.cosmology_model, '_cosmo'):
+            cosmo = self.cosmology_model._cosmo
             if hasattr(cosmo, 'H0'): 
                 # when the cosmology is fixed, cosmo.H0 is a np array with shape (1,) and dtype float.
                 self._default_H0 = float(cosmo.H0) if hasattr(cosmo.H0, "dtype") else 67.74
