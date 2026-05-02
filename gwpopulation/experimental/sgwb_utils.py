@@ -22,6 +22,8 @@ import bilby
 from bilby.core.utils import logger
 import numpy as np
 
+xp = np
+
 try:
     from wcosmo.astropy import Planck15 as _default_cosmo
     _DEFAULT_H0_SI = _default_cosmo.H0.to("1/s").value  # H0 in 1/s
@@ -69,12 +71,12 @@ def omega_gw(frequencies, wave_energies, weights, Rate_norm, H0=None):
     else:
         H0_si = _DEFAULT_H0_SI
     
-    conv = frequencies**3 * 4. * np.pi**2 / (3 * H0_si**2)
+    conv = frequencies**3 * 4. * xp.pi**2 / (3 * H0_si**2)
     # might consider adding some checks for re-weighting, like:
     # highvals = np.sort(weights)[-10:]
     # weights[weights==highvals]=0
     N_samples = len(weights)
     # weights shape (N_samples,), wave_energies shape (N_samples, freq_grids)
-    weighted_energy = np.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
+    weighted_energy = xp.nansum(weights[:, None] * wave_energies, axis=0) / N_samples
  
     return Rate_norm * conv * weighted_energy
