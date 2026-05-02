@@ -45,6 +45,7 @@ and can be calculated using :func:`gwpopulation.hyperpe.HyperparameterLikelihood
 import types
 
 import numpy as np
+from scipy import special as scs
 from bilby.core.likelihood import Likelihood
 from bilby.core.utils import logger
 from bilby.hyper.model import Model
@@ -597,29 +598,31 @@ class Stochastic_Likelihood(Likelihood):
         else:
             self.prefactor = 4./5
         self.conversion_function = conversion_function
-        self.samples = samples.copy()
+        self.samples = self._dict_to_backend(samples.copy())
         #todo create another attribute to save redshift from samples input.
         #! check it later.
-        self.samples_redshift = self.samples["redshift"]
+        self.samples_redshift = xp.asarray(self.samples["redshift"])
         # after accesing luminosity information, that column should be removed from samples.
-        self.samples_default_luminosity_distance = self.samples.pop("luminosity_distance")
+        self.samples_default_luminosity_distance = xp.asarray(
+            self.samples.pop("luminosity_distance")
+        )
 
         # Calibration uncertainty
         self.calibration_epsilon = calibration_epsilon
 
         # real measurements of the stochastic search.
-        self.CIJ = stochastic_data["CIJ"]
-        self.sigma = stochastic_data["sigma"]
-        self.frequencies = stochastic_data["frequencies"]
+        self.CIJ = xp.asarray(stochastic_data["CIJ"])
+        self.sigma = xp.asarray(stochastic_data["sigma"])
+        self.frequencies = xp.asarray(stochastic_data["frequencies"])
 
         # Frequency mask: True = include bin, default all bins.
         if frequency_mask is not None:
-            self.frequency_mask = np.asarray(frequency_mask, dtype=bool)
+            self.frequency_mask = xp.asarray(frequency_mask, dtype=bool)
         else:
-            self.frequency_mask = np.ones(len(self.frequencies), dtype=bool)
+            self.frequency_mask = xp.ones(len(self.frequencies), dtype=bool)
         
         if "prior" in self.samples:
-            self.sampling_prior = self.samples.pop("prior")
+            self.sampling_prior = xp.asarray(self.samples.pop("prior"))
         else:
             logger.info("No prior values provided, defaulting to 1.")
             self.sampling_prior = 1
@@ -649,6 +652,21 @@ class Stochastic_Likelihood(Likelihood):
     # -----------------------------------------------------------------
     # Properties
     # -----------------------------------------------------------------
+
+    @staticmethod
+    def _to_backend(value):
+        """Convert numeric array-like values to the active gwpopulation backend."""
+        try:
+            return xp.asarray(value)
+        except Exception:
+            return value
+
+    @classmethod
+    def _dict_to_backend(cls, data):
+        """Convert a sample dictionary to the active gwpopulation backend."""
+        return {key: cls._to_backend(value) for key, value in data.items()}
+
+
     @property
     def n_samples(self):                                               
         """Number of proposal samples."""
