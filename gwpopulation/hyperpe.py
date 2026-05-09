@@ -513,14 +513,14 @@ class LocalMergerRateLikelihood(HyperparameterLikelihood):
         return_uncertainty: bool
             Whether to return the uncertainty in the selection factor.
         """
-        efficiency, variance = self._selection_function_with_uncertainty(
+        selection, variance = self._selection_function_with_uncertainty(
             parameters=parameters
         )
-        vt = efficiency * self.selection_function.surveyed_hypervolume(parameters)
+        vt = selection * self.selection_function.surveyed_hypervolume(parameters)
         N_exp = vt * parameters["rate"]
         total_selection = -N_exp + self.n_posteriors * xp.log(parameters["rate"] * self.selection_function.surveyed_hypervolume(parameters))
         if return_uncertainty:
-            total_variance = N_exp * variance / efficiency**2
+            total_variance = N_exp**2 * xp.divide(variance, selection**2)
             return total_selection, total_variance
         else:
             return total_selection
