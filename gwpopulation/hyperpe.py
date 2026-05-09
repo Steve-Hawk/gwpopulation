@@ -678,18 +678,20 @@ class Stochastic_Likelihood(Likelihood):
         """Find model in hyper_prior that has cosmology method."""
         for model in self.hyper_prior.models:
             if hasattr(model, "cosmology"):
+                logger.info("Cosmology model found in hyper_prior.")
                 return model
-            else:
-                logger.info("No cosmology model found in hyper_prior, using default cosmology.")
+        
+        logger.info("No cosmology model found in hyper_prior, using default cosmology.")
         return None
 
     def _find_redshift_model(self):
         """Find the redshift model in hyper_prior."""
         for model in self.hyper_prior.models:
             if isinstance(model, _Redshift):
+                logger.info("Redshift model found in hyper_prior.")
                 return model
-            else:
-                logger.info("No Redshift model found in hyper_prior, probably needs further check.")
+        
+        logger.info("No Redshift model found in hyper_prior, probably needs further check.")
         return None
     
     def get_luminosity_distance_from_cosmology_model(self, parameters):
